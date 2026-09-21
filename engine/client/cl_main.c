@@ -104,8 +104,12 @@ CVAR_DEFINE_AUTO( cl_ticket_generator, "revemu2013", FCVAR_ARCHIVE|FCVAR_PRIVILE
 static CVAR_DEFINE_AUTO( cl_advertise_engine_in_name, "0", FCVAR_PROTECTED|FCVAR_READ_ONLY, "i think people don't like seeing someone tagged [Xash3D]" );
 static CVAR_DEFINE_AUTO( cl_goldsrc_munge, "0", 0, "goldSrc netchan packet munge: 0=off, 1=both directions (vanilla/ReHLDS servers), 2=outgoing only (Sven Coop dedicated servers unmunge inbound but send plain outbound)" );
 static CVAR_DEFINE_AUTO( cl_goldsrc_debug, "0", 0, "goldSrc connection debug level: 0=off, 1=signon state/seq, 2=+outgoing packet hexdumps (connect/move/reliable), 3=+incoming packet hexdumps & per-message detail, 4=+delta field-level bit ledger (every parsed field with bit positions), 5=+full delta table fieldlist dump on parse error" );
+static CVAR_DEFINE_AUTO( cl_goldsrc_sound, "0", 0, "sven svc107 experimental resolver mode: 0=SOUNDLIST only (default), 1=precache-first fallback to SOUNDLIST, 2=+predicted self melee whoosh (cbar_miss1), 3=+whoosh AND trace-based wall/body melee hits, 4=precache-first + whoosh" );
 static CVAR_DEFINE_AUTO( cl_log_outofband, "0", FCVAR_ARCHIVE, "log out of band messages, can be useful for server admins and for engine debugging" );
 static CVAR_DEFINE_AUTO( cl_autorecord, "0", 0, "automatically start recording a demo after joining the server" );
+
+void CL_PredictSvenMelee( void );
+extern const char *CL_SvenSoundName( int idx );
 
 client_t		cl;
 client_static_t	cls;
@@ -845,6 +849,102 @@ static void CL_CreateCmd( void )
 
 	// predict all unacknowledged movements
 	CL_PredictMovement( false );
+
+	CL_PredictSvenMelee();
+}
+
+/*
+==================
+CL_PredictSvenMelee
+
+Experimental (cl_goldsrc_sound >= 2): replicate the Sven client's locally
+PREDICTED melee sounds. The server never emits the local player's own crowbar
+swing/hit via svc 107 (verified: indices 124-129 never appear), so we play the
+whoosh (cbar_miss1) on a fresh IN_ATTACK press while a melee viewmodel is up,
+and in mode 3 also trace the view for hit discrimination (cbar_hit1/hitbod).
+Run right after CL_PredictMovement so pmove physents are current.
+==================
+*/
+void CL_PredictSvenMelee( void )
+{
+	int mode = (int)Cvar_VariableInteger( "cl_goldsrc_sound" );
+	static int prevbuttons = 0;
+	int att = cl.cmd.buttons;
+	int press;
+	const char *sndname;
+	char modelbuf[64];
+
+	if( mode < 2 ) { prevbuttons = att; return; }
+
+	press = (( att & IN_ATTACK ) && !( prevbuttons & IN_ATTACK ));
+	prevbuttons = att;
+	if( !press ) return;
+
+	// only when a melee weapon is the current viewmodel
+	modelbuf[0] = '\0';
+	if( clgame.viewent.model )
+		Q_strncpy( modelbuf, clgame.viewent.model->name, sizeof( modelbuf ));
+	if( !Q_strstr( modelbuf, "crowbar" ) && !Q_strstr( modelbuf, "cbar" ))
+	{
+		if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
+			Con_Printf( "SVEN-MELEE: press ignored, viewmodel='%s' (not a melee)\n", modelbuf );
+		return;
+	}
+
+	// mode 3: trace the view and pick hit/miss; modes 2/4: plain whoosh
+	if( mode == 3 )
+	{
+		vec3_t vf, start, end;
+		pmtrace_t tr;
+		qboolean isbrush = false;
+
+		AngleVectors( cl.viewangles, vf, NULL, NULL );
+		VectorCopy( cl.simorg, start );
+		start[2] += cl.viewheight[2];
+		VectorMA( start, 48.0f, vf, end );
+
+		tr = CL_TraceLine( start, end, 0 ); // PM_NORMAL, hit whatever is there
+		if( tr.fraction >= 1.0f )
+		{
+			sndname = CL_SvenSoundName( 129 );
+			if( !sndname ) sndname = "weapons/cbar_miss1.wav";
+			if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
+				Con_Printf( "SVEN-MELEE: seq=%d model='%s' TYPE=miss snd='%s'\n", cl.local.weaponsequence, modelbuf, sndname );
+			S_StartLocalSound( sndname, 1.0f, false );
+			return;
+		}
+
+		if( clgame.pmove && tr.ent >= 0 && tr.ent < clgame.pmove->numphysent )
+		{
+			physent_t *pe = &clgame.pmove->physents[tr.ent];
+			if( pe->solid == SOLID_BSP || pe->movetype == MOVETYPE_PUSHSTEP )
+				isbrush = true;
+		}
+
+		if( isbrush )
+		{
+			sndname = CL_SvenSoundName( 124 );	// cbar_hit1
+			if( !sndname ) sndname = "weapons/cbar_hit1.wav";
+			if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
+				Con_Printf( "SVEN-MELEE: seq=%d model='%s' TYPE=wall snd='%s' frac=%.2f\n", cl.local.weaponsequence, modelbuf, sndname, tr.fraction );
+			S_StartLocalSound( sndname, 1.0f, false );
+		}
+		else
+		{
+			sndname = CL_SvenSoundName( 126 );	// cbar_hitbod1
+			if( !sndname ) sndname = "weapons/cbar_hitbod1.wav";
+			if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
+				Con_Printf( "SVEN-MELEE: seq=%d model='%s' TYPE=body snd='%s' frac=%.2f\n", cl.local.weaponsequence, modelbuf, sndname, tr.fraction );
+			S_StartLocalSound( sndname, 1.0f, false );
+		}
+		return;
+	}
+
+	sndname = CL_SvenSoundName( 129 );
+	if( !sndname ) sndname = "weapons/cbar_miss1.wav";
+	if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
+		Con_Printf( "SVEN-MELEE: seq=%d model='%s' TYPE=whoosh snd='%s'\n", cl.local.weaponsequence, modelbuf, sndname );
+	S_StartLocalSound( sndname, 1.0f, false );
 }
 
 void CL_WriteUsercmd( connprotocol_t proto, sizebuf_t *msg, int from, int to )

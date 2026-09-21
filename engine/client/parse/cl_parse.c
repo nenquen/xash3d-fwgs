@@ -2400,6 +2400,15 @@ static void CL_LoadSvenSoundCache( void )
 	Con_DPrintf( "CL_LoadSvenSoundCache: %d sounds + %d sentences for %s\n", n, ns, mapbase );
 }
 
+// read-only accessor for the map's SOUNDLIST entry (used by the experimental
+// local melee prediction, cl_main.c CL_PredictSvenMelee). NULL when unavailable.
+const char *CL_SvenSoundName( int idx )
+{
+	if( svenSoundCacheLoaded && idx >= 0 && idx < SVEN_SOUNDCACHE_MAX && svenSoundCache[idx][0] )
+		return svenSoundCache[idx];
+	return NULL;
+}
+
 /*
 ==============
 CL_ParseSvenStartSound
@@ -2520,10 +2529,15 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 	// active-instance stop lookup (find the playing sound with this sndnum and
 	// cut it — anti-pileup for rapid fire). It is mirrored below with
 	// S_StopSound before playing, NOT by muting.
+	// EXPERIMENTAL (cl_goldsrc_sound 1 or 4): try cl.sound_precache[] first and
+	// only then the map SOUNDLIST, to A/B whether a given server's index space
+	// is really the file order (0) or something precache-shaped (1/4).
 	{
 		const char *src = "none";
 		const char *stopname = NULL;
 		char sentenceName[32];
+		int mode = Cvar_VariableInteger( "cl_goldsrc_sound" );
+		int usePrecache = ( mode == 1 || mode == 4 );
 		sentenceName[0] = '\0';
 		if( flags & SVEN_SND_SENTENCE )
 		{
@@ -2539,6 +2553,12 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 			playFlags |= SND_SENTENCE;
 			stopname = sentenceName;
 			src = "sent";
+		}
+		else if( usePrecache && sndnum < MAX_SOUNDS && cl.sound_precache[sndnum][0] )
+		{
+			handle = S_RegisterSound( cl.sound_precache[sndnum] );
+			stopname = cl.sound_precache[sndnum];
+			src = "precache";
 		}
 		else if( sndnum < SVEN_SOUNDCACHE_MAX && svenSoundCache[sndnum][0] )
 		{
@@ -2557,6 +2577,8 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 			char sndname[64];
 			if( !Q_strcmp( src, "cache" ))
 				Q_strncpy( sndname, svenSoundCache[sndnum], sizeof( sndname ));
+			else if( !Q_strcmp( src, "precache" ))
+				Q_strncpy( sndname, cl.sound_precache[sndnum], sizeof( sndname ));
 			else if( !Q_strcmp( src, "sent" ))
 				Q_strncpy( sndname, sentenceName, sizeof( sndname ));
 			else Q_strncpy( sndname, "(silent gap)", sizeof( sndname ));
