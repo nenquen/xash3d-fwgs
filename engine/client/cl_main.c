@@ -4004,6 +4004,9 @@ static void CL_InitLocal( void )
 	Cvar_RegisterVariable( &cl_allow_download );
 	Cvar_RegisterVariable( &cl_goldsrc_munge );
 	Cvar_RegisterVariable( &cl_goldsrc_debug );
+	Cvar_RegisterVariable( &cl_goldsrc_sound );
+	Cvar_RegisterVariable( &cl_goldsrc_melee_repeat );
+	Cvar_RegisterVariable( &cl_goldsrc_wade_step );
 	Cvar_RegisterVariable( &cl_download_ingame );
 	Cvar_RegisterVariable( &cl_logofile );
 	Cvar_RegisterVariable( &cl_logocolor );

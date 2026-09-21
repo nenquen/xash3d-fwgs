@@ -2452,6 +2452,7 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 	int pitch = PITCH_NORM;
 	float attn = ATTN_NORM;
 	vec3_t pos = { 0, 0, 0 };
+	qboolean hasOrigin = false;
 	int channel, ent;
 	sound_t handle = 0;
 	int playFlags = 0;
@@ -2500,6 +2501,7 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 		pos[0] = MSG_ReadCoord( &sb );
 		pos[1] = MSG_ReadCoord( &sb );
 		pos[2] = MSG_ReadCoord( &sb );
+		hasOrigin = true;
 	}
 	if( flags & SVEN_SND_EXTRA )
 		MSG_ReadFloat( &sb ); // extra field, consume only
@@ -2582,8 +2584,8 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 			else if( !Q_strcmp( src, "sent" ))
 				Q_strncpy( sndname, sentenceName, sizeof( sndname ));
 			else Q_strncpy( sndname, "(silent gap)", sizeof( sndname ));
-			Con_Printf( "SVEN-SOUND: flags=%04x idx=%d vol=%.2f pitch=%d attn=%.2f ch=%d ent=%d [%s] %s\n",
-				flags, sndnum, volume, pitch, attn, channel, ent, src, sndname );
+			Con_Printf( "SVEN-SOUND: flags=%04x idx=%d vol=%.2f pitch=%d attn=%.2f ch=%d ent=%d [%s%s] %s\n",
+				flags, sndnum, volume, pitch, attn, channel, ent, src, hasOrigin ? "" : " noloc", sndname );
 		}
 		// LEVEL-200 DIAG: dump the soundcache neighborhood around this index so an
 		// off-by-N shows up instantly. P[] (precache) is printed for reference
@@ -2622,9 +2624,18 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 	if( !handle || !cl.audio_prepped )
 		return;
 
+	// No ORIGIN on the wire (e.g. flags 0x30 self/UI sounds routed via a proxy
+	// ent like 419 that never exists client-side): the old code played them at
+	// the map center (0,0,0), which is ~2700u away here, so distance falloff
+	// muted them to exactly zero — wpn_select/swim/chew/wrench-miss were all
+	// silent. Play them AT the listener instead (NULL → refState.vieworg in
+	// S_StartSound), i.e. the same local/full-volume path as the predicted
+	// metal hit. When the ent DOES exist client-side, per-frame spatialization
+	// (CL_GetEntitySpatialization) still re-anchors the channel to the entity,
+	// so entity-tracked sounds keep working.
 	if( channel == CHAN_STATIC )
-		S_AmbientSound( pos, ent, handle, volume, attn, pitch, playFlags );
-	else S_StartSound( pos, ent, channel, handle, volume, attn, pitch, playFlags );
+		S_AmbientSound( hasOrigin ? pos : refState.vieworg, ent, handle, volume, attn, pitch, playFlags );
+	else S_StartSound( hasOrigin ? pos : NULL, ent, channel, handle, volume, attn, pitch, playFlags );
 }
 
 /*
