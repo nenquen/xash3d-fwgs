@@ -104,7 +104,9 @@ CVAR_DEFINE_AUTO( cl_ticket_generator, "revemu2013", FCVAR_ARCHIVE|FCVAR_PRIVILE
 static CVAR_DEFINE_AUTO( cl_advertise_engine_in_name, "0", FCVAR_PROTECTED|FCVAR_READ_ONLY, "i think people don't like seeing someone tagged [Xash3D]" );
 static CVAR_DEFINE_AUTO( cl_goldsrc_munge, "0", 0, "goldSrc netchan packet munge: 0=off, 1=both directions (vanilla/ReHLDS servers), 2=outgoing only (Sven Coop dedicated servers unmunge inbound but send plain outbound)" );
 static CVAR_DEFINE_AUTO( cl_goldsrc_debug, "0", 0, "goldSrc connection debug level: 0=off, 1=signon state/seq, 2=+outgoing packet hexdumps (connect/move/reliable), 3=+incoming packet hexdumps & per-message detail, 4=+delta field-level bit ledger (every parsed field with bit positions), 5=+full delta table fieldlist dump on parse error" );
-static CVAR_DEFINE_AUTO( cl_goldsrc_sound, "0", 0, "sven svc107 experimental resolver mode: 0=SOUNDLIST only (default), 1=precache-first fallback to SOUNDLIST, 2=+predicted self melee whoosh (cbar_miss1), 3=+whoosh AND trace-based wall/body melee hits, 4=precache-first + whoosh" );
+static CVAR_DEFINE_AUTO( cl_goldsrc_sound, "0", 0, "sven svc107 experimental resolver mode: 0=SOUNDLIST only (default), 1=precache-first fallback to SOUNDLIST, 2=+predicted self melee whoosh (cbar_miss1) & wade footprints (pl_wade*), 3=+whoosh/hit via view trace (cbar_hit1/cbar_hitbod1), 4=precache-first + whoosh" );
+static CVAR_DEFINE_AUTO( cl_goldsrc_melee_repeat, "0.4", 0, "sven predicted melee: auto-swing repeat cadence (seconds) while IN_ATTACK is held, 0 disables the hold-repeat (old press-edge-only behavior)" );
+static CVAR_DEFINE_AUTO( cl_goldsrc_wade_step, "0.45", 0, "sven predicted wade footprint cadence (seconds) while walking in shallow water, 0 disables" );
 static CVAR_DEFINE_AUTO( cl_log_outofband, "0", FCVAR_ARCHIVE, "log out of band messages, can be useful for server admins and for engine debugging" );
 static CVAR_DEFINE_AUTO( cl_autorecord, "0", 0, "automatically start recording a demo after joining the server" );
 
@@ -862,34 +864,17 @@ PREDICTED melee sounds. The server never emits the local player's own crowbar
 swing/hit via svc 107 (verified: indices 124-129 never appear), so we play the
 whoosh (cbar_miss1) on a fresh IN_ATTACK press while a melee viewmodel is up,
 and in mode 3 also trace the view for hit discrimination (cbar_hit1/hitbod).
+While IN_ATTACK stays held the crowbar auto-swings, so the swing sound repeats
+at cl_goldsrc_melee_repeat cadence (0 disables the hold-repeat).
+Also predicts the self WADE footprints (player/pl_wade*) that the Sven client
+preloads locally (pclog: cbar_hitbod1-3 + pl_wade1-4 are the 7 t_sound entries)
+and the server never sends (pl_wade absent from all svc 107 traffic).
 Run right after CL_PredictMovement so pmove physents are current.
 ==================
 */
-void CL_PredictSvenMelee( void )
+static const char *CL_SvenMeleeSwing( int mode, const char *modelbuf )
 {
-	int mode = (int)Cvar_VariableInteger( "cl_goldsrc_sound" );
-	static int prevbuttons = 0;
-	int att = cl.cmd.buttons;
-	int press;
 	const char *sndname;
-	char modelbuf[64];
-
-	if( mode < 2 ) { prevbuttons = att; return; }
-
-	press = (( att & IN_ATTACK ) && !( prevbuttons & IN_ATTACK ));
-	prevbuttons = att;
-	if( !press ) return;
-
-	// only when a melee weapon is the current viewmodel
-	modelbuf[0] = '\0';
-	if( clgame.viewent.model )
-		Q_strncpy( modelbuf, clgame.viewent.model->name, sizeof( modelbuf ));
-	if( !Q_strstr( modelbuf, "crowbar" ) && !Q_strstr( modelbuf, "cbar" ))
-	{
-		if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
-			Con_Printf( "SVEN-MELEE: press ignored, viewmodel='%s' (not a melee)\n", modelbuf );
-		return;
-	}
 
 	// mode 3: trace the view and pick hit/miss; modes 2/4: plain whoosh
 	if( mode == 3 )
@@ -911,7 +896,7 @@ void CL_PredictSvenMelee( void )
 			if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
 				Con_Printf( "SVEN-MELEE: seq=%d model='%s' TYPE=miss snd='%s'\n", cl.local.weaponsequence, modelbuf, sndname );
 			S_StartLocalSound( sndname, 1.0f, false );
-			return;
+			return sndname;
 		}
 
 		if( clgame.pmove && tr.ent >= 0 && tr.ent < clgame.pmove->numphysent )
@@ -937,7 +922,7 @@ void CL_PredictSvenMelee( void )
 				Con_Printf( "SVEN-MELEE: seq=%d model='%s' TYPE=body snd='%s' frac=%.2f\n", cl.local.weaponsequence, modelbuf, sndname, tr.fraction );
 			S_StartLocalSound( sndname, 1.0f, false );
 		}
-		return;
+		return sndname;
 	}
 
 	sndname = CL_SvenSoundName( 129 );
@@ -945,6 +930,69 @@ void CL_PredictSvenMelee( void )
 	if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
 		Con_Printf( "SVEN-MELEE: seq=%d model='%s' TYPE=whoosh snd='%s'\n", cl.local.weaponsequence, modelbuf, sndname );
 	S_StartLocalSound( sndname, 1.0f, false );
+	return sndname;
+}
+
+void CL_PredictSvenMelee( void )
+{
+	int mode = (int)Cvar_VariableInteger( "cl_goldsrc_sound" );
+	static int prevbuttons = 0;
+	static double lastwade = 0.0;
+	static double lastmelee = 0.0;
+	int att = cl.cmd.buttons;
+	int press = (( att & IN_ATTACK ) && !( prevbuttons & IN_ATTACK ));
+	char modelbuf[64];
+
+	prevbuttons = att;
+	if( mode < 2 ) return;
+
+	// wade footprints: walking in shallow water, locally predicted (server
+	// never sends pl_wade*; pclog proves the real client preloads them).
+	if( cl.local.waterlevel == 1 || cl.local.waterlevel == 2 )
+	{
+		float cd = Cvar_VariableValue( "cl_goldsrc_wade_step" );
+		if( cd > 0 )
+		{
+			vec3_t vel;
+			float speed;
+			VectorCopy( cl.simvel, vel );
+			vel[2] = 0;
+			speed = VectorLength( vel );
+			if( cl.local.onground != -1 && speed > 20.0f && host.realtime >= lastwade )
+			{
+				char wade[32];
+				Q_snprintf( wade, sizeof( wade ), "player/pl_wade%d.wav", (int)COM_RandomLong( 1, 4 ));
+				S_StartLocalSound( wade, 0.5f, false );
+				if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
+					Con_Printf( "SVEN-MELEE: TYPE=wade snd='%s' speed=%.0f wl=%d\n", wade, speed, cl.local.waterlevel );
+				lastwade = host.realtime + cd;
+			}
+		}
+	}
+
+	// melee viewmodel check (only when the crowbar is up)
+	modelbuf[0] = '\0';
+	if( clgame.viewent.model )
+		Q_strncpy( modelbuf, clgame.viewent.model->name, sizeof( modelbuf ));
+	if( !Q_strstr( modelbuf, "crowbar" ) && !Q_strstr( modelbuf, "cbar" ))
+	{
+		if( press && Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
+			Con_Printf( "SVEN-MELEE: press ignored, viewmodel='%s' (not a melee)\n", modelbuf );
+		return;
+	}
+
+	if( press )
+	{
+		// fresh swing: fire immediately regardless of cadence
+		CL_SvenMeleeSwing( mode, modelbuf );
+		lastmelee = host.realtime + Cvar_VariableValue( "cl_goldsrc_melee_repeat" );
+	}
+	else if(( att & IN_ATTACK ) && Cvar_VariableValue( "cl_goldsrc_melee_repeat" ) > 0 && host.realtime >= lastmelee )
+	{
+		// button held: crowbar auto-swings, repeat at the swing cadence
+		CL_SvenMeleeSwing( mode, modelbuf );
+		lastmelee = host.realtime + Cvar_VariableValue( "cl_goldsrc_melee_repeat" );
+	}
 }
 
 void CL_WriteUsercmd( connprotocol_t proto, sizebuf_t *msg, int from, int to )
