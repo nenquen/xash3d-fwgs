@@ -2287,19 +2287,45 @@ and addresses most StartSound(107) indices through it — the resourcelist
 precache only carries a handful of sounds (4 on the observed server). The real
 client maintains the same table (it even has cl_flushsoundcache commands).
 Loaded lazily on first StartSound and reloaded on map change.
+
+The SENTENCELIST section carries the per-map sentence names that svc 107
+sentence events (flags & 0x100) index by number. The real Sven client numbers
+its VOX sentence table from sound/default_sentences.txt (soundcache verifies:
+RBS/bodyguard landmark indices match the PC log line for line), but plain
+numeric "!N" is fragile — the engine's VOX table can differ from the map's
+SENTENCELIST (e.g. duplicate-named sentence lines). We resolve sentences by
+NAME from this section instead, so "!name" always matches PC playback.
 ==============
 */
 #define SVEN_SOUNDCACHE_MAX 4096
 static char svenSoundCache[SVEN_SOUNDCACHE_MAX][64];
+static char svenSentenceList[SVEN_SOUNDCACHE_MAX][64];
 static char svenSoundCacheMap[64];
 static qboolean svenSoundCacheLoaded = false;
 
+// NUL-terminates and trims the next physical line in the loaded file buffer,
+// advancing *pp past its terminator. Returns NULL past the end of buffer.
+static char *CL_SoundCacheNextLine( char **pp, char *end )
+{
+	char *line, *eol, *t;
+
+	line = *pp;
+	if( line >= end ) return NULL;
+	eol = line;
+	while( eol < end && *eol != '\n' ) eol++;
+	if( eol < end ) *eol = '\0';
+	*pp = eol + 1;
+	t = eol - 1;
+	while( t >= line && ( *t == '\r' || *t == ' ' || *t == '\t' )) *t-- = '\0';
+	return line;
+}
+
 static void CL_LoadSvenSoundCache( void )
 {
-	char path[MAX_QPATH], mapbase[MAX_QPATH], *line, *end;
+	char path[MAX_QPATH], mapbase[MAX_QPATH], *line, *end, *p;
 	byte *buf;
 	fs_offset_t size;
-	int n;
+	int n, ns;
 
 	if( COM_StringEmptyOrNULL( clgame.mapname ))
 		return; // too early, retry on the next sound
@@ -2315,46 +2341,63 @@ static void CL_LoadSvenSoundCache( void )
 
 	buf = FS_LoadFile( path, &size, false );
 	memset( svenSoundCache, 0, sizeof( svenSoundCache ));
+	memset( svenSentenceList, 0, sizeof( svenSentenceList ));
 	Q_strncpy( svenSoundCacheMap, clgame.mapname, sizeof( svenSoundCacheMap ));
 	svenSoundCacheLoaded = true; // don't retry every sound; reloads on map change
 	if( !buf || !size )
 		return;
 
 	// collect .wav lines after "SOUNDLIST {", stop at the closing section
-	n = 0;
 	line = (char *)buf;
 	end = line + size;
+	p = line;
+	n = 0;
 	{
 		qboolean inlist = false;
-		while( line < end && n < SVEN_SOUNDCACHE_MAX )
+		while( p < end && n < SVEN_SOUNDCACHE_MAX )
 		{
-			char *eol = line;
-			while( eol < end && *eol != '\n' ) eol++;
+			char *l = CL_SoundCacheNextLine( &p, end );
+			if( !l ) break;
+			if( !Q_strcmp( l, "SOUNDLIST {" ))
 			{
-				char save = ( eol < end ) ? *eol : '\0';
-				if( eol < end ) *eol = '\0';
-				// trim trailing whitespace/CR
-				{
-					char *t = eol - 1;
-					while( t >= line && ( *t == '\r' || *t == ' ' || *t == '\t' )) *t-- = '\0';
-				}
-				if( !Q_strcmp( line, "SOUNDLIST {" ))
-					inlist = true;
-				else if( inlist && ( !Q_strcmp( line, "}" ) || !Q_strcmp( line, "SENTENCELIST {" )))
-					break;
-				else if( inlist )
-				{
-					size_t len = Q_strlen( line );
-					if( len > 4 && !Q_stricmp( line + len - 4, ".wav" ))
-						Q_strncpy( svenSoundCache[n++], line, sizeof( svenSoundCache[0] ));
-				}
-				if( eol < end ) *eol = save;
+				inlist = true;
+				continue;
 			}
-			line = eol + 1;
+			if( inlist )
+			{
+				if( !Q_strcmp( l, "}" )) break;
+				size_t len = Q_strlen( l );
+				if( len > 4 && !Q_stricmp( l + len - 4, ".wav" ))
+					Q_strncpy( svenSoundCache[n++], l, sizeof( svenSoundCache[0] ));
+			}
+		}
+	}
+	// collect the first token of each line after "SENTENCELIST {" (sentence name)
+	{
+		qboolean inlist = false;
+		while( p < end && ns < SVEN_SOUNDCACHE_MAX )
+		{
+			char *l = CL_SoundCacheNextLine( &p, end );
+			if( !l ) break;
+			if( !Q_strcmp( l, "SENTENCELIST {" ))
+			{
+				inlist = true;
+				continue;
+			}
+			if( inlist )
+			{
+				if( !Q_strcmp( l, "}" )) break;
+				{
+					char *sp = l;
+					while( *sp && *sp != ' ' && *sp != '\t' ) sp++;
+					if( *sp ) *sp = '\0';
+					if( l[0] ) Q_strncpy( svenSentenceList[ns++], l, sizeof( svenSentenceList[0] ));
+				}
+			}
 		}
 	}
 	Mem_Free( buf );
-	Con_DPrintf( "CL_LoadSvenSoundCache: %d sounds for %s\n", n, mapbase );
+	Con_DPrintf( "CL_LoadSvenSoundCache: %d sounds + %d sentences for %s\n", n, ns, mapbase );
 }
 
 /*
@@ -2376,7 +2419,8 @@ pitch raw byte (default PITCH_NORM), attn byte/64 (default ATTN_NORM; the
 NOTE: unlike vanilla (vol,attn,pitch) Sven sends pitch BEFORE attenuation,
 so the vanilla SND_ATTENUATION/SND_PITCH names do NOT apply to bits 1/2.
 flags & 0x100 selects the SENTENCELIST namespace (sndnum = sentence index,
-played as "!N"); when 0x100 is clear sndnum is a SOUNDLIST index into
+played by the map's sentence NAME as "!name"), and 0x1000 skips the /64
+volume division (raw attenuation byte).
 maps/soundcache/<map>.txt (file line order — the real client resolves it as
 this+0x1700C+sndnum*0x104). cl.sound_precache[] is NEVER the source here.
 CHAN_STATIC goes ambient.
@@ -2467,7 +2511,7 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 		return;
 
 	// Table selection (client.dll reverse, steam-refs/chatgpt/answer9):
-	//   flags & 0x100          -> SENTENCELIST index, play sentence "!N"
+	//   flags & 0x100          -> SENTENCELIST index, play the sentence NAME "!name"
 	//   flags & 0x100 == 0     -> SOUNDLIST index into maps/soundcache/<map>.txt
 	// The real client resolves the latter as this+0x1700C+sndnum*0x104, i.e.
 	// bit 0x100 is a SENTENCE flag, NOT a precache table selector, and
@@ -2483,7 +2527,14 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 		sentenceName[0] = '\0';
 		if( flags & SVEN_SND_SENTENCE )
 		{
-			Q_snprintf( sentenceName, sizeof( sentenceName ), "!%i", sndnum );
+			// Resolve by the map's SENTENCELIST name, not by numeric "!N":
+			// the server numbers sentences from that list, and the engine VOX
+			// table can shift (duplicate-named sentence lines are merged on
+			// the real client, not appended). "!name" is then found by NAME
+			// in VOX_LookupString, so playback matches the PC client exactly.
+			if( sndnum >= 0 && sndnum < SVEN_SOUNDCACHE_MAX && svenSentenceList[sndnum][0] )
+				Q_snprintf( sentenceName, sizeof( sentenceName ), "!%s", svenSentenceList[sndnum] );
+			else Q_snprintf( sentenceName, sizeof( sentenceName ), "!%i", sndnum );
 			handle = S_RegisterSound( sentenceName );
 			playFlags |= SND_SENTENCE;
 			stopname = sentenceName;
@@ -2507,7 +2558,7 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 			if( !Q_strcmp( src, "cache" ))
 				Q_strncpy( sndname, svenSoundCache[sndnum], sizeof( sndname ));
 			else if( !Q_strcmp( src, "sent" ))
-				Q_snprintf( sndname, sizeof( sndname ), "!%i", sndnum );
+				Q_strncpy( sndname, sentenceName, sizeof( sndname ));
 			else Q_strncpy( sndname, "(silent gap)", sizeof( sndname ));
 			Con_Printf( "SVEN-SOUND: flags=%04x idx=%d vol=%.2f pitch=%d attn=%.2f ch=%d ent=%d [%s] %s\n",
 				flags, sndnum, volume, pitch, attn, channel, ent, src, sndname );
