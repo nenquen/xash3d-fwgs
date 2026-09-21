@@ -2624,18 +2624,21 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 	if( !handle || !cl.audio_prepped )
 		return;
 
-	// No ORIGIN on the wire (e.g. flags 0x30 self/UI sounds routed via a proxy
-	// ent like 419 that never exists client-side): the old code played them at
-	// the map center (0,0,0), which is ~2700u away here, so distance falloff
-	// muted them to exactly zero — wpn_select/swim/chew/wrench-miss were all
-	// silent. Play them AT the listener instead (NULL → refState.vieworg in
-	// S_StartSound), i.e. the same local/full-volume path as the predicted
-	// metal hit. When the ent DOES exist client-side, per-frame spatialization
+	// No ORIGIN on the wire (e.g. flags 0x30 sounds routed via a proxy ent like
+	// 419 that never exists client-side): pass the zero vector EXACTLY like the
+	// real client does (client.dll leaves its origin buffer zeroed — answer9).
+	// The at-listener experiment was reverted: those proxy sounds turned out to
+	// belong to someone else's fight (local player stationary at a wall while
+	// wrench-miss/swim/select bursts arrived), so playing them at full volume
+	// at the listener blasted a distant fight over the correct local sounds.
+	// With (0,0,0) they fall off to silence with distance, same as PC.
+	// When the ent DOES exist client-side, per-frame spatialization
 	// (CL_GetEntitySpatialization) still re-anchors the channel to the entity,
-	// so entity-tracked sounds keep working.
+	// and sounds tagged with the local player's own ent already play full
+	// volume via the S_IsClient shortcut in SND_Spatialize.
 	if( channel == CHAN_STATIC )
-		S_AmbientSound( hasOrigin ? pos : refState.vieworg, ent, handle, volume, attn, pitch, playFlags );
-	else S_StartSound( hasOrigin ? pos : NULL, ent, channel, handle, volume, attn, pitch, playFlags );
+		S_AmbientSound( pos, ent, handle, volume, attn, pitch, playFlags );
+	else S_StartSound( pos, ent, channel, handle, volume, attn, pitch, playFlags );
 }
 
 /*
