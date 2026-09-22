@@ -2422,6 +2422,15 @@ static void CL_LoadSvenSoundCache( void )
 	Con_DPrintf( "CL_LoadSvenSoundCache: %d sounds + %d sentences for %s\n", n, ns, mapbase );
 }
 
+// read-only accessor for the map's SOUNDLIST entry (used by the local melee
+// prediction, cl_main.c CL_PredictSvenMelee). NULL when unavailable.
+const char *CL_SvenSoundName( int idx )
+{
+	if( svenSoundCacheLoaded && idx >= 0 && idx < SVEN_SOUNDCACHE_MAX && svenSoundCache[idx][0] )
+		return svenSoundCache[idx];
+	return NULL;
+}
+
 /*
 ==============
 CL_ParseSvenStartSound
