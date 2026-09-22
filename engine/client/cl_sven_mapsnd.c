@@ -165,6 +165,11 @@ void CL_SvenPlayTextureHit( vec3_t start, vec3_t end, int physent, const char *r
 	else if( clgame.pmove )
 		type = CL_SvenTextureMaterial( PM_CL_TraceTexture( physent, start, end ));
 
+	// always log the resolved material so we can tell a working lookup from a
+	// default 'C' (osprey walls are all concrete/metal and return early)
+	if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
+		Con_Printf( "SVEN-MAT: type=%c tex='%s'\n", type, raw ? raw : "" );
+
 	switch( type )
 	{
 	// concrete and metal carry no extra debris: the crowbar strike itself
@@ -204,18 +209,48 @@ void CL_SvenPlayTextureHit( vec3_t start, vec3_t end, int physent, const char *r
 	handle = S_RegisterSound( snd );
 	if( handle )
 		S_AmbientSound( end, 0, handle, fvol, fattn, COM_RandomLong( 96, 111 ), 0 );
-
-	if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
-		Con_Printf( "SVEN-MAT: type=%c tex='%s' snd='%s' vol=%.1f attn=%.1f\n", type, raw ? raw : "", snd, fvol, fattn );
 }
 
 // ----------------------------------------------------------------------------
-// map BSP entity scan (doors/buttons are detected at runtime, see below)
+// map BSP entity scan: ambient_generic + func_button 'sounds' selector
+// (fact from server.dll: "sounds" = atoi(N), NEVER networked, table below)
+// + func_door movesnd/stopsnd (selector unanswered yet, keep origin for when
+// the client copy of the door table arrives)
 // ----------------------------------------------------------------------------
 #define SVEN_AMBIENTS_MAX	64
+#define SVEN_ENTSND_MAX		256
 #define SVEN_MOVER_RANGE	700.0f
 #define SVEN_MOVE_EPS		0.35f
 #define SVEN_SMALLBRUSH	64.0f
+
+// func_button "sounds" -> wav (verified statically in server.dll image:
+// buttons/button1..11 + latch/switch/lever, selector at m_sounds).
+static const char *Sven_ButtonSound( int sounds )
+{
+	switch( sounds )
+	{
+	case 1:  return "buttons/button1.wav";
+	case 2:  return "buttons/button2.wav";
+	case 3:  return "buttons/button3.wav";
+	case 4:  return "buttons/button4.wav";
+	case 5:  return "buttons/button5.wav";
+	case 6:  return "buttons/button6.wav";
+	case 7:  return "buttons/button7.wav";
+	case 8:  return "buttons/button8.wav";
+	case 9:  return "buttons/button9.wav";
+	case 10: return "buttons/button10.wav";
+	case 11: return "buttons/button11.wav";
+	case 12: return "buttons/latchlocked1.wav";
+	case 13: return "buttons/latchunlocked1.wav";
+	case 14: return "buttons/lightswitch2.wav";
+	case 15: return "buttons/lever1.wav";
+	case 16: return "buttons/lever2.wav";
+	case 17: return "buttons/lever3.wav";
+	case 18: return "buttons/lever4.wav";
+	case 19: return "buttons/lever5.wav";
+	default: return NULL; // sounds=0 or unset: mapper/death default
+	}
+}
 
 typedef struct
 {
@@ -227,13 +262,49 @@ typedef struct
 	qboolean started;
 } sven_ambient_t;
 
+typedef struct
+{
+	vec3_t	origin;
+	int	sounds;		// func_button "sounds" selector (m_sounds)
+} sven_button_t;
+
+typedef struct
+{
+	vec3_t	origin;
+	int	movesnd;	// func_door selector, unused until the door table lands
+	int	stopsnd;
+} sven_door_t;
+
 static sven_ambient_t	svenAmbients[SVEN_AMBIENTS_MAX];
 static int		svenAmbientsCount;
+static sven_button_t	svenButtons[SVEN_ENTSND_MAX];
+static int		svenButtonsCount;
+static sven_door_t	svenDoors[SVEN_ENTSND_MAX];
+static int		svenDoorsCount;
 static vec3_t		*svenMoverLast;	// per-entity last origin
 static byte		*svenMoverMove;	// per-entity moving/idle flag
 static byte		*svenMoverKnown;	// per-entity first-sight flag
 static int		svenMoverCap;
 static char		svenMapSndMap[MAX_QPATH];
+
+// nearest recorded func_button by world origin, distance-aware (< range).
+static int CL_SvenButtonByOrigin( const vec3_t origin, float range )
+{
+	int i, best = -1;
+	float bestdist = range;
+
+	for( i = 0; i < svenButtonsCount; i++ )
+	{
+		float d = VectorDistance( origin, svenButtons[i].origin );
+
+		if( d < bestdist )
+		{
+			bestdist = d;
+			best = i;
+		}
+	}
+	return best;
+}
 
 static void CL_SvenMapSoundsInit( void )
 {
@@ -242,6 +313,8 @@ static void CL_SvenMapSoundsInit( void )
 	{
 		svenAmbientsCount = 0;
 		memset( svenAmbients, 0, sizeof( svenAmbients ));
+		svenButtonsCount = 0;
+		svenDoorsCount = 0;
 		Q_strncpy( svenMapSndMap, clgame.mapname, sizeof( svenMapSndMap ));
 	}
 
@@ -267,7 +340,7 @@ static void CL_SvenMapSoundsInit( void )
 		return;
 
 	// walk the world entity lump with the same COM_ParseFile scanner as
-	// Mod_LoadEntities, collecting ambient_generic definitions.
+	// Mod_LoadEntities, collecting ambient_generic + moveable brush records.
 	{
 		char token[MAX_TOKEN];
 		char keyname[64];
@@ -281,7 +354,7 @@ static void CL_SvenMapSoundsInit( void )
 			char cls[128] = "";
 			char msg[128] = "";
 			vec3_t org = { 0.0f, 0.0f, 0.0f };
-			int sflags = 0;
+			int sflags = 0, sounds = 0, movesnd = 0, stopsnd = 0;
 
 			while( 1 )
 			{
@@ -301,6 +374,12 @@ static void CL_SvenMapSoundsInit( void )
 					Q_strncpy( msg, token, sizeof( msg ));
 				else if( !Q_stricmp( keyname, "spawnflags" ))
 					sflags = Q_atoi( token );
+				else if( !Q_stricmp( keyname, "sounds" ))
+					sounds = Q_atoi( token );
+				else if( !Q_stricmp( keyname, "movesnd" ))
+					movesnd = Q_atoi( token );
+				else if( !Q_stricmp( keyname, "stopsnd" ))
+					stopsnd = Q_atoi( token );
 				else if( !Q_stricmp( keyname, "origin" ))
 					sscanf( token, "%f %f %f", &org[0], &org[1], &org[2] );
 			}
@@ -321,6 +400,31 @@ static void CL_SvenMapSoundsInit( void )
 				if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
 					Con_Printf( "SVEN-AMB: org=%.0f %.0f %.0f msg='%s' flags=%d loop=%d\n",
 						org[0], org[1], org[2], msg, sflags, a->activeLoop );
+			}
+			else if( !Q_stricmp( cls, "func_button" ) && svenButtonsCount < SVEN_ENTSND_MAX )
+			{
+				sven_button_t *b = &svenButtons[svenButtonsCount];
+
+				VectorCopy( org, b->origin );
+				b->sounds = sounds;
+				svenButtonsCount++;
+				if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
+					Con_Printf( "SVEN-BTN: org=%.0f %.0f %.0f sounds=%d ('%s')\n",
+						org[0], org[1], org[2], sounds,
+						Sven_ButtonSound( sounds ) ? Sven_ButtonSound( sounds ) : "default" );
+			}
+			else if(( !Q_stricmp( cls, "func_door" ) || !Q_stricmp( cls, "func_door_rotating" ))
+				&& svenDoorsCount < SVEN_ENTSND_MAX )
+			{
+				sven_door_t *d = &svenDoors[svenDoorsCount];
+
+				VectorCopy( org, d->origin );
+				d->movesnd = movesnd;
+				d->stopsnd = stopsnd;
+				svenDoorsCount++;
+				if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
+					Con_Printf( "SVEN-DOOR: org=%.0f %.0f %.0f movesnd=%d stopsnd=%d\n",
+						org[0], org[1], org[2], movesnd, stopsnd );
 			}
 		}
 	}
@@ -366,7 +470,7 @@ void CL_SvenPredictMapSounds( void )
 		cl_entity_t *ent = &clgame.entities[i];
 		vec3_t delta;
 		float dist, diag;
-		qboolean moving;
+		qboolean moving, hasbox, isbutton;
 
 		if( i == ( cl.playernum + 1 ))
 			continue;
@@ -381,26 +485,41 @@ void CL_SvenPredictMapSounds( void )
 
 		if( svenMoverKnown[i] && ( moving != svenMoverMove[i] ) && ( dist > SVEN_MOVE_EPS || !moving ))
 		{
-			const char *snd;
+			const char *snd = NULL;
 			sound_t handle;
 
-			diag = VectorLength( ent->curstate.maxs ) - VectorLength( ent->curstate.mins );
+			// bbox may not be transmitted for movers; treat lack of it as a
+			// door (large movers) instead of a phantom tiny "button"
+			hasbox = !VectorIsNull( ent->curstate.maxs ) && !VectorIsNull( ent->curstate.mins );
+			diag = hasbox ? ( VectorLength( ent->curstate.maxs ) - VectorLength( ent->curstate.mins )) : 0.0f;
+			isbutton = hasbox && diag < SVEN_SMALLBRUSH;
 
 			if( VectorDistance( ent->curstate.origin, cl.simorg ) < SVEN_MOVER_RANGE )
 			{
-				if( moving && diag < SVEN_SMALLBRUSH )
-					snd = "buttons/button1.wav";	// small brush: func_button
-				else if( moving )
-					snd = "doors/doormove1.wav";	// travel sound
-				else
-					snd = "doors/doorstop1.wav";	// stop sound
+				if( moving && isbutton )
+				{
+					// press: match against the map's func_button record -> its
+					// own "sounds" selector (m_sounds), exact server table
+					int bi = CL_SvenButtonByOrigin( ent->curstate.origin, SVEN_SMALLBRUSH );
 
-				handle = S_RegisterSound( snd );
-				if( handle )
-					S_AmbientSound( ent->curstate.origin, i, handle, 1.0f, 0.5f, 100, 0 );
-				if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
-					Con_Printf( "SVEN-MOV: #%d '%s' %s diag=%.0f dist=%.2f\n", i, snd,
-						moving ? "MOVE" : "STOP", diag, dist );
+					snd = ( bi >= 0 ) ? Sven_ButtonSound( svenButtons[bi].sounds ) : NULL;
+					if( !snd ) snd = "buttons/button1.wav"; // default button press
+				}
+				else if( moving )
+					snd = "doors/doormove1.wav";	// travel sound (door: pending)
+				else if( !isbutton )
+					snd = "doors/doorstop1.wav";	// stop sound, never for buttons
+				// button release stays silent
+
+				if( snd )
+				{
+					handle = S_RegisterSound( snd );
+					if( handle )
+						S_AmbientSound( ent->curstate.origin, i, handle, 1.0f, 0.5f, 100, 0 );
+					if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
+						Con_Printf( "SVEN-MOV: #%d '%s' %s diag=%.0f dist=%.2f btn=%d\n", i, snd,
+							moving ? "MOVE" : "STOP", diag, dist, isbutton );
+				}
 			}
 		}
 
