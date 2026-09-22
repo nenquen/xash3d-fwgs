@@ -2431,6 +2431,14 @@ const char *CL_SvenSoundName( int idx )
 	return NULL;
 }
 
+// true once the current map's soundcache is loaded (i.e. we are on a
+// Sven-like server). The sound mixer uses it to select FMOD-style inverse
+// distance rolloff instead of the classic linear curve.
+qboolean CL_SvenSoundActive( void )
+{
+	return svenSoundCacheLoaded;
+}
+
 /*
 ==============
 CL_ParseSvenStartSound

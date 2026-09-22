@@ -596,8 +596,28 @@ static void SND_Spatialize( channel_t *ch )
 		if( ch->dist_mult <= 0.0f ) dot = 0.0f;
 	}
 
-	// fill out channel volumes for single location
-	S_SpatializeChannel( &ch->leftvol, &ch->rightvol, ch->master_vol, dot, dist * ch->dist_mult );
+	// fill out channel volumes for single location.
+	// Sven servers (soundcache active) use FMOD-style inverse distance rolloff:
+	// the real client plays 107 sounds through FMOD itself, whose default
+	// inverse curve melts distant sounds into background (500u battle ~= 4%),
+	// while our linear falloff keeps them at 60%+ ("random loud sounds
+	// everywhere", e.g. a far gauss fight drowning the door you just opened).
+	// Vanilla servers keep the classic linear curve (local test validated it).
+	{
+		float frac = dist * ch->dist_mult;
+		extern qboolean CL_SvenSoundActive( void );
+		if( CL_SvenSoundActive() && ch->dist_mult > 0.0f )
+		{
+			// eff = distance in attn-scaled units (dist_mult = attn/1000).
+			// Full volume inside SVEN_ROLLOFF_MIN (footsteps/huddle range),
+			// inverse falloff beyond: 64/(64 + (eff-64)*3).
+			float eff = dist * ch->dist_mult * SND_CLIP_DISTANCE;
+			if( eff > SVEN_ROLLOFF_MIN )
+				frac = 1.0f - ( SVEN_ROLLOFF_MIN / ( SVEN_ROLLOFF_MIN + ( eff - SVEN_ROLLOFF_MIN ) * SVEN_ROLLOFF_K ));
+			else frac = 0.0f;
+		}
+		S_SpatializeChannel( &ch->leftvol, &ch->rightvol, ch->master_vol, dot, frac );
+	}
 
 	// if playing a word, set volume
 	VOX_SetChanVol( ch );
