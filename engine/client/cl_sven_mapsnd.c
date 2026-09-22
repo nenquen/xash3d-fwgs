@@ -10,16 +10,22 @@
 *	  the crowbar strike to a debris material ("wood" -> debris/woodN.wav) that
 *	  the server would have emitted via UTIL_EmitAmbientSound. This is a port of
 *	  TEXTURETYPE_PlaySound from hlsdk dlls/sound.cpp (world-hit half).
-*	- active looping ambient_generic: origin/message/spawnflags come from the
-*	  map BSP entity lump; the client animates them locally (the 0bc76 baseline
-*	  proves the server never sends the loop start).
-*	- brush movers (func_door / func_button): move/stop sounds are annotated
-*	  onto the entity origin updates the server DOES stream, so travelling
-*	  doors and pressed buttons become audible without any server change.
-*
-*	Everything is gated by CL_SvenSoundActive() (current map soundcache loaded =
-*	Sven-like server), so vanilla GoldSrc sessions keep server-provided sounds
-*	untouched and there is no double playback with a vanilla StartSound path.
+*	- active looping ambient_generic: origin/message/spawnflags/vol/pitch come
+ *	  from the map BSP entity lump; the client animates them locally (the
+ *	  0bc76 baseline proves the server never sends the loop start). The
+ *	  attenuation constant follows the radius spawnflags (hlsdk sound.cpp).
+ *	- brush movers (func_door / func_button): move/stop sounds are annotated
+ *	  onto the entity origin updates the server DOES stream, so travelling
+ *	  doors and pressed buttons become audible without any server change.
+ *	  func_door movesnd/stopsnd select the loop/landing file exactly like
+ *	  hlsdk doors.cpp (doors/doormove1..10.wav, doors/doorstop1..8.wav).
+ *	- wall chargers (func_recharge / func_healthcharger): while +use is held
+ *	  near a recorded charger the first-contact chirp and the loop hum are
+ *	  reproduced (hlsdk h_battery.cpp / healthkit.cpp).
+ *
+ *	Everything is gated by CL_SvenSoundActive() (current map soundcache loaded =
+ *	Sven-like server), so vanilla GoldSrc sessions keep server-provided sounds
+ *	untouched and there is no double playback with a vanilla StartSound path.
 *
 *	Foundations only: per-weapon voice prediction, charger hum and
 *	scripted_sentence playback are the next layer to build on top of this file.
@@ -220,6 +226,8 @@ void CL_SvenPlayTextureHit( vec3_t start, vec3_t end, int physent, const char *r
 #define SVEN_AMBIENTS_MAX	64
 #define SVEN_ENTSND_MAX		256
 #define SVEN_MOVER_RANGE	700.0f
+#define SVEN_DOOR_MATCH	256.0f	// rest-origin match radius for door records
+#define SVEN_CHARGER_RANGE	256.0f
 #define SVEN_MOVE_EPS		0.35f
 #define SVEN_SMALLBRUSH	64.0f
 
@@ -257,6 +265,9 @@ typedef struct
 	vec3_t	origin;
 	char	message[128];
 	int	spawnflags;
+	int	vol;		// "vol" keyvalue, hi-nibble 0-10 scale (precached cap)
+	int	pitch;		// "pitch" keyvalue (0-255, default 100)
+	float	attn;		// derived from the radius spawnflags
 	qboolean activeLoop;
 	sound_t	handle;
 	qboolean started;
@@ -271,9 +282,20 @@ typedef struct
 typedef struct
 {
 	vec3_t	origin;
-	int	movesnd;	// func_door selector, unused until the door table lands
-	int	stopsnd;
+	int	movesnd;	// func_door movesnd selector -> doors/doormoveN.wav
+	int	stopsnd;	// func_door stopsnd selector -> doors/doorstopN.wav
 } sven_door_t;
+
+// func_recharge (suit) & func_healthcharger wall chargers: the server links
+// the hum loop to the map entity, which never arrives on the client.
+typedef struct
+{
+	vec3_t	origin;
+	qboolean isSuit;	// false = health charger
+	float	checkAt;
+	qboolean onedone;	// first-contact chirp already played
+	qboolean humming;	// hum loop currently running (our channel)
+} sven_charger_t;
 
 static sven_ambient_t	svenAmbients[SVEN_AMBIENTS_MAX];
 static int		svenAmbientsCount;
@@ -281,9 +303,12 @@ static sven_button_t	svenButtons[SVEN_ENTSND_MAX];
 static int		svenButtonsCount;
 static sven_door_t	svenDoors[SVEN_ENTSND_MAX];
 static int		svenDoorsCount;
+static sven_charger_t	svenChargers[SVEN_ENTSND_MAX];
+static int		svenChargersCount;
 static vec3_t		*svenMoverLast;	// per-entity last origin
 static byte		*svenMoverMove;	// per-entity moving/idle flag
 static byte		*svenMoverKnown;	// per-entity first-sight flag
+static sound_t		*svenMoverLoop;	// per-entity active travelloop handle
 static int		svenMoverCap;
 static char		svenMapSndMap[MAX_QPATH];
 
@@ -306,6 +331,87 @@ static int CL_SvenButtonByOrigin( const vec3_t origin, float range )
 	return best;
 }
 
+// nearest recorded func_door by world origin (the door sits at its recorded
+// origin while at rest, its travel loop slot is on the same still point).
+static int CL_SvenDoorByOrigin( const vec3_t origin, float range )
+{
+	int i, best = -1;
+	float bestdist = range;
+
+	for( i = 0; i < svenDoorsCount; i++ )
+	{
+		float d = VectorDistance( origin, svenDoors[i].origin );
+
+		if( d < bestdist )
+		{
+			bestdist = d;
+			best = i;
+		}
+	}
+	return best;
+}
+
+// func_door selects its travel/arrival sounds with movesnd/stopsnd, the
+// exact hlsdk doors.cpp table -> doors/doormove1..10.wav & doorstop1..8.wav,
+// 0 selects silence (common/null.wav). svencoop ships the identical files.
+static const char *Sven_DoorMoveSound( int movesnd )
+{
+	switch( movesnd )
+	{
+	case 1:  return "doors/doormove1.wav";
+	case 2:  return "doors/doormove2.wav";
+	case 3:  return "doors/doormove3.wav";
+	case 4:  return "doors/doormove4.wav";
+	case 5:  return "doors/doormove5.wav";
+	case 6:  return "doors/doormove6.wav";
+	case 7:  return "doors/doormove7.wav";
+	case 8:  return "doors/doormove8.wav";
+	case 9:  return "doors/doormove9.wav";
+	case 10: return "doors/doormove10.wav";
+	default: return NULL; // movesnd=0 or unset: silent door
+	}
+}
+
+static const char *Sven_DoorStopSound( int stopsnd )
+{
+	switch( stopsnd )
+	{
+	case 1:  return "doors/doorstop1.wav";
+	case 2:  return "doors/doorstop2.wav";
+	case 3:  return "doors/doorstop3.wav";
+	case 4:  return "doors/doorstop4.wav";
+	case 5:  return "doors/doorstop5.wav";
+	case 6:  return "doors/doorstop6.wav";
+	case 7:  return "doors/doorstop7.wav";
+	case 8:  return "doors/doorstop8.wav";
+	default: return NULL; // stopsnd=0 or unset: silent landing
+	}
+}
+
+// func_recharge (suit) chap + hum sequence (hlsdk h_battery.cpp):
+// first contact -> items/suitchargeok1.wav once, then the loop hum.
+static const char *Sven_ChargerChirp( const sven_charger_t *c )
+{
+	return c->isSuit ? "items/suitchargeok1.wav" : "items/medshot4.wav";
+}
+
+static const char *Sven_ChargerHum( const sven_charger_t *c )
+{
+	return c->isSuit ? "items/suitcharge1.wav" : "items/medcharge4.wav";
+}
+
+// ambient_generic attenuation follows the radius spawnflags exactly like
+// hlsdk sound.cpp Spawn(): EVERYWHERE=1 -> ATTN_NONE, SMALLRADIUS=2 ->
+// ATTN_IDLE, MEDIUMRADIUS=4 -> ATTN_STATIC, LARGERADIUS=8 -> ATTN_NORM,
+// no radius bit -> ATTN_STATIC default.
+static float Sven_AmbientAttn( int sflags )
+{
+	if( sflags & 1 ) return ATTN_NONE;
+	if( sflags & 2 ) return ATTN_IDLE;
+	if( sflags & 8 ) return ATTN_NORM;
+	return ATTN_STATIC; // explicit MEDIUMRADIUS(4) and no-bit default
+}
+
 static void CL_SvenMapSoundsInit( void )
 {
 	// new map (or first call): drop everything and re-read the entity lump
@@ -315,6 +421,7 @@ static void CL_SvenMapSoundsInit( void )
 		memset( svenAmbients, 0, sizeof( svenAmbients ));
 		svenButtonsCount = 0;
 		svenDoorsCount = 0;
+		svenChargersCount = 0;
 		Q_strncpy( svenMapSndMap, clgame.mapname, sizeof( svenMapSndMap ));
 	}
 
@@ -327,13 +434,17 @@ static void CL_SvenMapSoundsInit( void )
 			Mem_Free( svenMoverMove );
 		if( svenMoverKnown )
 			Mem_Free( svenMoverKnown );
+		if( svenMoverLoop )
+			Mem_Free( svenMoverLoop );
 
 		svenMoverCap = clgame.maxEntities;
 		svenMoverLast = ( vec3_t *)Mem_Malloc( cls.mempool, svenMoverCap * sizeof( vec3_t ));
 		svenMoverMove = ( byte *)Mem_Malloc( cls.mempool, svenMoverCap );
 		svenMoverKnown = ( byte *)Mem_Malloc( cls.mempool, svenMoverCap );
+		svenMoverLoop = ( sound_t *)Mem_Malloc( cls.mempool, svenMoverCap * sizeof( sound_t ));
 		memset( svenMoverMove, 0, svenMoverCap );
 		memset( svenMoverKnown, 0, svenMoverCap );
+		memset( svenMoverLoop, 0, svenMoverCap * sizeof( sound_t ));
 	}
 
 	if( !cl.worldmodel || !cl.worldmodel->entities )
@@ -355,6 +466,7 @@ static void CL_SvenMapSoundsInit( void )
 			char msg[128] = "";
 			vec3_t org = { 0.0f, 0.0f, 0.0f };
 			int sflags = 0, sounds = 0, movesnd = 0, stopsnd = 0;
+			int vol = 0, pitch = 0;
 
 			while( 1 )
 			{
@@ -380,6 +492,10 @@ static void CL_SvenMapSoundsInit( void )
 					movesnd = Q_atoi( token );
 				else if( !Q_stricmp( keyname, "stopsnd" ))
 					stopsnd = Q_atoi( token );
+				else if( !Q_stricmp( keyname, "vol" ))
+					vol = Q_atoi( token );
+				else if( !Q_stricmp( keyname, "pitch" ))
+					pitch = Q_atoi( token );
 				else if( !Q_stricmp( keyname, "origin" ))
 					sscanf( token, "%f %f %f", &org[0], &org[1], &org[2] );
 			}
@@ -395,11 +511,18 @@ static void CL_SvenMapSoundsInit( void )
 				// active forever-loops start at map start; one-shot start
 				// sounds play once; use-triggered ones stay server-side.
 				a->activeLoop = !( sflags & ( 16 | 32 ));
+				// "vol" runs on a 0-10 scale in these maps ("warn1" uses 7);
+				// a fvol of clamp(vol,1,10)/10 reaches ~full at 10 and at the
+				// classic full-scale values (100/255) without over-driving.
+				a->vol = vol;
+				a->pitch = pitch ? pitch : 100;
+				a->attn = Sven_AmbientAttn( sflags );
 				svenAmbientsCount++;
 
 				if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
-					Con_Printf( "SVEN-AMB: org=%.0f %.0f %.0f msg='%s' flags=%d loop=%d\n",
-						org[0], org[1], org[2], msg, sflags, a->activeLoop );
+					Con_Printf( "SVEN-AMB: org=%.0f %.0f %.0f msg='%s' flags=%d loop=%d vol=%d pitch=%d attn=%.2f\n",
+						org[0], org[1], org[2], msg, sflags, a->activeLoop,
+						a->vol, a->pitch, a->attn );
 			}
 			else if( !Q_stricmp( cls, "func_button" ) && svenButtonsCount < SVEN_ENTSND_MAX )
 			{
@@ -423,8 +546,24 @@ static void CL_SvenMapSoundsInit( void )
 				d->stopsnd = stopsnd;
 				svenDoorsCount++;
 				if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
-					Con_Printf( "SVEN-DOOR: org=%.0f %.0f %.0f movesnd=%d stopsnd=%d\n",
-						org[0], org[1], org[2], movesnd, stopsnd );
+					Con_Printf( "SVEN-DOOR: org=%.0f %.0f %.0f movesnd=%d ('%s') stopsnd=%d ('%s')\n",
+						org[0], org[1], org[2], movesnd,
+						Sven_DoorMoveSound( movesnd ) ? Sven_DoorMoveSound( movesnd ) : "silent",
+						stopsnd,
+						Sven_DoorStopSound( stopsnd ) ? Sven_DoorStopSound( stopsnd ) : "silent" );
+			}
+			else if(( !Q_stricmp( cls, "func_recharge" ) || !Q_stricmp( cls, "func_healthcharger" ))
+				&& svenChargersCount < SVEN_ENTSND_MAX )
+			{
+				sven_charger_t *c = &svenChargers[svenChargersCount];
+
+				VectorCopy( org, c->origin );
+				c->isSuit = !Q_stricmp( cls, "func_recharge" );
+				c->checkAt = 0.0f;
+				svenChargersCount++;
+				if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
+					Con_Printf( "SVEN-CHG: org=%.0f %.0f %.0f %s\n",
+						org[0], org[1], org[2], c->isSuit ? "suit" : "health" );
 			}
 		}
 	}
@@ -457,9 +596,69 @@ void CL_SvenPredictMapSounds( void )
 		a->handle = S_RegisterSound( a->message );
 		if( a->handle )
 		{
-			S_AmbientSound( a->origin, 0, a->handle, 1.0f, 0.5f, 100, 0 );
+			float fvol = bound( 0.0f, ( a->vol ? a->vol : 10 ) / 10.0f, 1.0f );
+
+			S_AmbientSound( a->origin, 0, a->handle, fvol, a->attn, a->pitch, 0 );
 			a->started = true;
-			Con_DPrintf( "SVEN-AMB: started loop '%s'\n", a->message );
+			Con_DPrintf( "SVEN-AMB: started loop '%s' vol=%.2f attn=%.2f pitch=%d\n",
+				a->message, fvol, a->attn, a->pitch );
+		}
+	}
+
+	// wall chargers: while +use is held near a recorded charger, reproduce
+	// the first-contact chirp then hang the charging hum on a loop slot
+	// (mirrors hlsdk CRecharge::Off / CHealthCharger::Off). The hum stop on
+	// release is distance-independent so walking off can't strand a loop.
+	{
+		qboolean useflag = ( cl.cmd.buttons & IN_USE ) != 0;
+
+		for( i = 0; i < svenChargersCount; i++ )
+		{
+			sven_charger_t *c = &svenChargers[i];
+			sound_t chirp, hum;
+
+			if( useflag )
+			{
+				if( VectorDistance( c->origin, cl.simorg ) > SVEN_CHARGER_RANGE )
+					continue;
+
+				if( !c->humming )
+				{
+					if( !c->onedone )
+					{
+						chirp = S_RegisterSound( Sven_ChargerChirp( c ));
+						if( chirp )
+							S_AmbientSound( c->origin, 0, chirp, c->isSuit ? 0.85f : 1.0f, ATTN_NORM, 100, 0 );
+						c->onedone = true;
+						c->checkAt = 0.5f + cl.time;
+					}
+					if( c->checkAt && cl.time >= c->checkAt )
+					{
+						hum = S_RegisterSound( Sven_ChargerHum( c ));
+						if( hum )
+						{
+							S_AmbientSound( c->origin, 0, hum, c->isSuit ? 0.85f : 1.0f, ATTN_NORM, 100, 0 );
+							c->humming = true;
+							c->checkAt = 0.0f;
+							Con_DPrintf( "SVEN-CHG: hum on '%s'\n", Sven_ChargerHum( c ));
+						}
+					}
+				}
+			}
+			else if( c->humming || ( c->onedone && cl.time >= c->checkAt ))
+			{
+				// release (walked off or let go): cut the loop, forget chirp
+				if( c->humming )
+				{
+					hum = S_RegisterSound( Sven_ChargerHum( c ));
+					if( hum )
+						S_AmbientSound( c->origin, 0, hum, 0, 0, 0, SND_STOP );
+				}
+				c->humming = false;
+				c->onedone = false;
+				c->checkAt = 0.0f;
+				Con_DPrintf( "SVEN-CHG: hum off\n" );
+			}
 		}
 	}
 
@@ -487,12 +686,18 @@ void CL_SvenPredictMapSounds( void )
 		{
 			const char *snd = NULL;
 			sound_t handle;
+			int di = -1;
 
 			// bbox may not be transmitted for movers; treat lack of it as a
 			// door (large movers) instead of a phantom tiny "button"
 			hasbox = !VectorIsNull( ent->curstate.maxs ) && !VectorIsNull( ent->curstate.mins );
 			diag = hasbox ? ( VectorLength( ent->curstate.maxs ) - VectorLength( ent->curstate.mins )) : 0.0f;
 			isbutton = hasbox && diag < SVEN_SMALLBRUSH;
+
+			// match the mover to its recorded func_door by its rest origin
+			// (at rest the brush sits exactly on the recorded origin)
+			if( !isbutton )
+				di = CL_SvenDoorByOrigin( ent->curstate.origin, SVEN_DOOR_MATCH );
 
 			if( VectorDistance( ent->curstate.origin, cl.simorg ) < SVEN_MOVER_RANGE )
 			{
@@ -506,19 +711,42 @@ void CL_SvenPredictMapSounds( void )
 					if( !snd ) snd = "buttons/button1.wav"; // default button press
 				}
 				else if( moving )
-					snd = "doors/doormove1.wav";	// travel sound (door: pending)
+				{
+					// travel: the door's movesnd selector picks the loop file
+					// (0 => silent door, no loop at all)
+					snd = ( di >= 0 ) ? Sven_DoorMoveSound( svenDoors[di].movesnd ) : NULL;
+					if( !snd ) snd = "doors/doormove1.wav";
+				}
 				else if( !isbutton )
-					snd = "doors/doorstop1.wav";	// stop sound, never for buttons
+				{
+					// landing: silence the running travel loop, then dent the
+					// arrival; stopsnd=0 (or a silent travel) still allows the
+					// default landing sound unless stopsnd names silence
+					if( svenMoverLoop[i] )
+					{
+						handle = svenMoverLoop[i];
+						S_AmbientSound( ent->curstate.origin, i, handle, 0, 0, 0, SND_STOP );
+						svenMoverLoop[i] = 0;
+					}
+					snd = NULL;
+					if( di >= 0 )
+						snd = Sven_DoorStopSound( svenDoors[di].stopsnd );
+					if( !snd ) snd = "doors/doorstop1.wav";
+				}
 				// button release stays silent
 
 				if( snd )
 				{
 					handle = S_RegisterSound( snd );
 					if( handle )
-						S_AmbientSound( ent->curstate.origin, i, handle, 1.0f, 0.5f, 100, 0 );
+					{
+						if( moving && !isbutton )
+							svenMoverLoop[i] = handle; // remember for the stop
+						S_AmbientSound( ent->curstate.origin, i, handle, 1.0f, ATTN_NORM, 100, 0 );
+					}
 					if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
-						Con_Printf( "SVEN-MOV: #%d '%s' %s diag=%.0f dist=%.2f btn=%d\n", i, snd,
-							moving ? "MOVE" : "STOP", diag, dist, isbutton );
+						Con_Printf( "SVEN-MOV: #%d '%s' %s diag=%.0f dist=%.2f btn=%d loop=%d\n", i, snd,
+							moving ? "MOVE" : "STOP", diag, dist, isbutton, svenMoverLoop[i] != 0 );
 				}
 			}
 		}
