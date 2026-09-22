@@ -109,6 +109,8 @@ static CVAR_DEFINE_AUTO( cl_autorecord, "0", 0, "automatically start recording a
 
 void CL_PredictSvenMelee( void );
 extern const char *CL_SvenSoundName( int idx );
+void CL_SvenPredictMapSounds( void );
+void CL_SvenPlayTextureHit( vec3_t start, vec3_t end, int physent, const char *raw );
 
 client_t		cl;
 client_static_t	cls;
@@ -850,6 +852,9 @@ static void CL_CreateCmd( void )
 	CL_PredictMovement( false );
 
 	CL_PredictSvenMelee();
+
+	// Sven map/entity sound prediction (materials, doors, ambient loops)
+	CL_SvenPredictMapSounds();
 }
 
 /*
@@ -911,6 +916,11 @@ static void CL_SvenMeleeSwing( const char *modelbuf )
 		if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
 			Con_Printf( "SVEN-MELEE: seq=%d model='%s' TYPE=wall snd='%s' frac=%.2f\n", cl.local.weaponsequence, modelbuf, sndname, tr.fraction );
 		S_StartLocalSound( sndname, 1.0f, false );
+
+		// material debris sound at the impact point (hlsdk
+		// TEXTURETYPE_PlaySound): wood/glass/concrete/slosh textures emit their
+		// own debris wav which the server never sends
+		CL_SvenPlayTextureHit( start, end, tr.ent, NULL );
 	}
 	else
 	{
