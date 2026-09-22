@@ -157,6 +157,7 @@ void CL_SvenPlayTextureHit( vec3_t start, vec3_t end, int physent, const char *r
 {
 	const char *rgsz[4];
 	const char *snd;
+	const char *texname = NULL;
 	char type;
 	float fvol, fattn = 0.5f;
 	int cnt = 0;
@@ -167,14 +168,20 @@ void CL_SvenPlayTextureHit( vec3_t start, vec3_t end, int physent, const char *r
 
 	type = 'C';
 	if( raw )
+	{
+		texname = raw;
 		type = CL_SvenTextureMaterial( raw );
+	}
 	else if( clgame.pmove )
-		type = CL_SvenTextureMaterial( PM_CL_TraceTexture( physent, start, end ));
+	{
+		texname = PM_CL_TraceTexture( physent, start, end );
+		type = CL_SvenTextureMaterial( texname );
+	}
 
 	// always log the resolved material so we can tell a working lookup from a
 	// default 'C' (osprey walls are all concrete/metal and return early)
 	if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
-		Con_Printf( "SVEN-MAT: type=%c tex='%s'\n", type, raw ? raw : "" );
+		Con_Printf( "SVEN-MAT: type=%c tex='%s'\n", type, texname ? texname : "(none)" );
 
 	switch( type )
 	{
@@ -492,7 +499,7 @@ static void CL_SvenMapSoundsInit( void )
 					movesnd = Q_atoi( token );
 				else if( !Q_stricmp( keyname, "stopsnd" ))
 					stopsnd = Q_atoi( token );
-				else if( !Q_stricmp( keyname, "vol" ))
+				else if( !Q_stricmp( keyname, "vol" ) || !Q_stricmp( keyname, "volume" ))
 					vol = Q_atoi( token );
 				else if( !Q_stricmp( keyname, "pitch" ))
 					pitch = Q_atoi( token );

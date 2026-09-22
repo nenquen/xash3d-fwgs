@@ -2593,7 +2593,14 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 	// plus world ambients; drop identical index slots that reference entities
 	// the client never received or that stopped updating — those come back as
 	// the same silence the stock Sven client's StartSound stub produces.
-	const qboolean entLive = CL_SvenSoundEntityLive( ent );
+	// Wave 1 relaxation (user feedback: the vanilla reference build b98411a
+	// played all of this map's sounds and sounded correct): when the wire
+	// carries an ORIGIN (the huge majority here — impacts, grunts, fallpain,
+	// turret chatter) the sound is a positional event and does not require the
+	// named client entity to be alive to be heard; only ORIGIN-less sounds
+	// keep the strict entity-liveness gate so proxy/phantom slots (the ones
+	// routed through an entity that never exists, e.g. 419) stay silent.
+	const qboolean entLive = CL_SvenSoundEntityLive( ent ) || hasOrigin;
 
 	// Table selection (client.dll reverse, steam-refs/chatgpt/answer9):
 	//   flags & 0x100          -> SENTENCELIST index, play the sentence NAME "!name"
