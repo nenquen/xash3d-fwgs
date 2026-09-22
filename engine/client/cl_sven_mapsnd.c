@@ -243,6 +243,13 @@ void CL_SvenPlayTextureHit( vec3_t start, vec3_t end, int physent, const char *r
 #define SVEN_CHARGER_RANGE	256.0f
 #define SVEN_MOVE_EPS		0.35f
 #define SVEN_SMALLBRUSH	64.0f
+// Dwell gate against update-step flapping: a continuously moving brush
+// (train, jittering mover) is seen as MOVE/STOP/MOVE... at the network
+// update rate, and every phantom MOVE re-fired a press/travel sound
+// (80 default button1 clicks from 2 entities in one session). A genuine
+// start/stop needs the opposite state held this long first; human
+// re-presses are slower, update gaps are faster.
+#define SVEN_DWELL_TIME	0.2f
 
 // func_button "sounds" -> wav (verified statically in server.dll image:
 // buttons/button1..11 + latch/switch/lever, selector at m_sounds).
@@ -325,6 +332,8 @@ static vec3_t		*svenMoverLast;	// per-entity last origin
 static byte		*svenMoverMove;	// per-entity moving/idle flag
 static byte		*svenMoverKnown;	// per-entity first-sight flag
 static sound_t		*svenMoverLoop;	// per-entity active travelloop handle
+static float		*svenMoverStill;	// per-entity time of last rest (dwell gate)
+static float		*svenMoverMotion;	// per-entity time of last genuine start
 static int		svenMoverCap;
 static char		svenMapSndMap[MAX_QPATH];
 
@@ -479,6 +488,8 @@ static void CL_SvenMapSoundsInit( void )
 			memset( svenMoverMove, 0, svenMoverCap );
 			memset( svenMoverKnown, 0, svenMoverCap );
 			memset( svenMoverLoop, 0, svenMoverCap * sizeof( sound_t ));
+			memset( svenMoverStill, 0, svenMoverCap * sizeof( float ));
+			memset( svenMoverMotion, 0, svenMoverCap * sizeof( float ));
 		}
 	}
 
@@ -493,15 +504,23 @@ static void CL_SvenMapSoundsInit( void )
 			Mem_Free( svenMoverKnown );
 		if( svenMoverLoop )
 			Mem_Free( svenMoverLoop );
+		if( svenMoverStill )
+			Mem_Free( svenMoverStill );
+		if( svenMoverMotion )
+			Mem_Free( svenMoverMotion );
 
 		svenMoverCap = clgame.maxEntities;
 		svenMoverLast = ( vec3_t *)Mem_Malloc( cls.mempool, svenMoverCap * sizeof( vec3_t ));
 		svenMoverMove = ( byte *)Mem_Malloc( cls.mempool, svenMoverCap );
 		svenMoverKnown = ( byte *)Mem_Malloc( cls.mempool, svenMoverCap );
 		svenMoverLoop = ( sound_t *)Mem_Malloc( cls.mempool, svenMoverCap * sizeof( sound_t ));
+		svenMoverStill = ( float *)Mem_Malloc( cls.mempool, svenMoverCap * sizeof( float ));
+		svenMoverMotion = ( float *)Mem_Malloc( cls.mempool, svenMoverCap * sizeof( float ));
 		memset( svenMoverMove, 0, svenMoverCap );
 		memset( svenMoverKnown, 0, svenMoverCap );
 		memset( svenMoverLoop, 0, svenMoverCap * sizeof( sound_t ));
+		memset( svenMoverStill, 0, svenMoverCap * sizeof( float ));
+		memset( svenMoverMotion, 0, svenMoverCap * sizeof( float ));
 	}
 
 	if( !cl.worldmodel || !cl.worldmodel->entities )
@@ -764,6 +783,18 @@ void CL_SvenPredictMapSounds( void )
 
 		if( svenMoverKnown[i] && ( moving != svenMoverMove[i] ) && ( dist > SVEN_MOVE_EPS || !moving ))
 		{
+			// dwell gate: a genuine start needs rest held DWELL_TIME, a
+			// genuine stop needs motion held DWELL_TIME. Update-step
+			// flapping of continuous motion passes state through silently.
+			// A running travel loop is always silenced on stop (no leak),
+			// but the landing dent needs a genuine stop.
+			qboolean genuine;
+			if( moving ) genuine = ( cl.time - svenMoverStill[i] ) >= SVEN_DWELL_TIME;
+			else genuine = svenMoverMotion[i] > 0.0f && ( cl.time - svenMoverMotion[i] ) >= SVEN_DWELL_TIME;
+			if( moving && genuine )
+				svenMoverMotion[i] = cl.time;
+			if( genuine || svenMoverLoop[i] )
+			{
 			const char *snd = NULL;
 			sound_t handle;
 			int di = -1;
@@ -799,9 +830,10 @@ void CL_SvenPredictMapSounds( void )
 				}
 				else if( !isbutton )
 				{
-					// landing: silence the running travel loop, then dent the
-					// arrival; stopsnd=0 (or a silent travel) still allows the
-					// default landing sound unless stopsnd names silence
+					// landing: silence the running travel loop (always, no
+					// leak), then dent the arrival only on a genuine stop.
+					// stopsnd=0 still allows the default landing sound
+					// unless stopsnd names silence
 					if( svenMoverLoop[i] )
 					{
 						handle = svenMoverLoop[i];
@@ -809,9 +841,12 @@ void CL_SvenPredictMapSounds( void )
 						svenMoverLoop[i] = 0;
 					}
 					snd = NULL;
-					if( di >= 0 )
-						snd = Sven_DoorStopSound( svenDoors[di].stopsnd );
-					if( !snd ) snd = "doors/doorstop1.wav";
+					if( genuine )
+					{
+						if( di >= 0 )
+							snd = Sven_DoorStopSound( svenDoors[di].stopsnd );
+						if( !snd ) snd = "doors/doorstop1.wav";
+					}
 				}
 				// button release stays silent
 
@@ -821,7 +856,12 @@ void CL_SvenPredictMapSounds( void )
 					if( handle )
 					{
 						if( moving && !isbutton )
+						{
+							// restart safety: never stack two travel loops
+							if( svenMoverLoop[i] )
+								S_AmbientSound( liveCenter, i, svenMoverLoop[i], 0, 0, 0, SND_STOP );
 							svenMoverLoop[i] = handle; // remember for the stop
+						}
 						S_AmbientSound( liveCenter, i, handle, 1.0f, ATTN_NORM, 100, 0 );
 					}
 					if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
@@ -831,9 +871,14 @@ void CL_SvenPredictMapSounds( void )
 			}
 		}
 		}
+		if( !moving )
+			svenMoverStill[i] = cl.time;
+		}
 
 		VectorCopy( ent->curstate.origin, svenMoverLast[i] );
 		svenMoverMove[i] = moving ? 1 : 0;
+		if( !svenMoverKnown[i] )
+			svenMoverStill[i] = -SVEN_DWELL_TIME; // first sight counts as rested
 		svenMoverKnown[i] = 1;
 	}
 }
