@@ -233,7 +233,13 @@ void CL_SvenPlayTextureHit( vec3_t start, vec3_t end, int physent, const char *r
 #define SVEN_AMBIENTS_MAX	64
 #define SVEN_ENTSND_MAX		256
 #define SVEN_MOVER_RANGE	700.0f
-#define SVEN_DOOR_MATCH	256.0f	// rest-origin match radius for door records
+// Record match radii. Records and live movers are compared by WORLD-SPACE
+// BRUSH CENTER (submodel bounds midpoint), never by entity-lump "origin":
+// sliding func_door/func_button and wall chargers sit at "0 0 0" in the lump,
+// so origin matching binds every mover to the first record and positions
+// every sound at the map origin (missing/wrong door, button and charger audio).
+#define SVEN_DOOR_MATCH	128.0f	// rest-center match radius for door records
+#define SVEN_BTN_MATCH	96.0f	// rest-center match radius for button records
 #define SVEN_CHARGER_RANGE	256.0f
 #define SVEN_MOVE_EPS		0.35f
 #define SVEN_SMALLBRUSH	64.0f
@@ -282,23 +288,26 @@ typedef struct
 
 typedef struct
 {
-	vec3_t	origin;
+	vec3_t	origin;		// world-space brush center (submodel bounds midpoint)
 	int	sounds;		// func_button "sounds" selector (m_sounds)
+	int	model;		// BSP submodel ("*N"), 0 when the lump has no model key
 } sven_button_t;
 
 typedef struct
 {
-	vec3_t	origin;
+	vec3_t	origin;		// world-space brush center (submodel bounds midpoint)
 	int	movesnd;	// func_door movesnd selector -> doors/doormoveN.wav
 	int	stopsnd;	// func_door stopsnd selector -> doors/doorstopN.wav
+	int	model;		// BSP submodel ("*N"), 0 when the lump has no model key
 } sven_door_t;
 
 // func_recharge (suit) & func_healthcharger wall chargers: the server links
 // the hum loop to the map entity, which never arrives on the client.
 typedef struct
 {
-	vec3_t	origin;
+	vec3_t	origin;		// world-space brush center (submodel bounds midpoint)
 	qboolean isSuit;	// false = health charger
+	int	model;		// BSP submodel ("*N"), 0 when the lump has no model key
 	float	checkAt;
 	qboolean onedone;	// first-contact chirp already played
 	qboolean humming;	// hum loop currently running (our channel)
@@ -319,7 +328,7 @@ static sound_t		*svenMoverLoop;	// per-entity active travelloop handle
 static int		svenMoverCap;
 static char		svenMapSndMap[MAX_QPATH];
 
-// nearest recorded func_button by world origin, distance-aware (< range).
+// nearest recorded func_button by brush center, distance-aware (< range).
 static int CL_SvenButtonByOrigin( const vec3_t origin, float range )
 {
 	int i, best = -1;
@@ -338,8 +347,8 @@ static int CL_SvenButtonByOrigin( const vec3_t origin, float range )
 	return best;
 }
 
-// nearest recorded func_door by world origin (the door sits at its recorded
-// origin while at rest, its travel loop slot is on the same still point).
+// nearest recorded func_door by brush center (the door sits on its recorded
+// center while at rest, its travel loop slot is on the same still point).
 static int CL_SvenDoorByOrigin( const vec3_t origin, float range )
 {
 	int i, best = -1;
@@ -419,6 +428,39 @@ static float Sven_AmbientAttn( int sflags )
 	return ATTN_STATIC; // explicit MEDIUMRADIUS(4) and no-bit default
 }
 
+// World-space center of BSP submodel "*N" (dmodel_t mins/maxs are absolute
+// brush bounds). Brush entities (func_door, func_button, chargers) carry no
+// usable "origin" in the entity lump — sliding doors/buttons sit at 0 0 0 —
+// so records are anchored to this center instead. Returns false when the
+// index is out of range (world not loaded yet), caller falls back to "origin".
+static qboolean CL_SvenBrushCenter( int submodel, vec3_t out )
+{
+	const dmodel_t *bm;
+
+	if( submodel <= 0 || !cl.worldmodel || submodel >= cl.worldmodel->numsubmodels )
+		return false;
+	bm = &cl.worldmodel->submodels[submodel];
+	VectorAdd( bm->mins, bm->maxs, out );
+	VectorScale( out, 0.5f, out );
+	return true;
+}
+
+// Live world-space center of a brush entity: origin + bbox midpoint. This is
+// exactly the engine's absmin/absmax midpoint under either bound convention,
+// so it tracks the brush (sliding doors, pressed buttons) and equals the
+// record center while the mover is at rest. Falls back to origin without bbox.
+static void CL_SvenLiveCenter( const cl_entity_t *ent, vec3_t out )
+{
+	if( !VectorIsNull( ent->curstate.maxs ) && !VectorIsNull( ent->curstate.mins ))
+	{
+		vec3_t mid;
+		VectorAdd( ent->curstate.maxs, ent->curstate.mins, mid );
+		VectorScale( mid, 0.5f, mid );
+		VectorAdd( ent->curstate.origin, mid, out );
+	}
+	else VectorCopy( ent->curstate.origin, out );
+}
+
 static void CL_SvenMapSoundsInit( void )
 {
 	// new map (or first call): drop everything and re-read the entity lump
@@ -430,6 +472,14 @@ static void CL_SvenMapSoundsInit( void )
 		svenDoorsCount = 0;
 		svenChargersCount = 0;
 		Q_strncpy( svenMapSndMap, clgame.mapname, sizeof( svenMapSndMap ));
+		// entity slots are per-connection: forget latched mover state too,
+		// or first transitions on the new map are skipped as "already known"
+		if( svenMoverCap )
+		{
+			memset( svenMoverMove, 0, svenMoverCap );
+			memset( svenMoverKnown, 0, svenMoverCap );
+			memset( svenMoverLoop, 0, svenMoverCap * sizeof( sound_t ));
+		}
 	}
 
 	// lazy per-entity buffers, sized to the connection's entity limit
@@ -473,7 +523,7 @@ static void CL_SvenMapSoundsInit( void )
 			char msg[128] = "";
 			vec3_t org = { 0.0f, 0.0f, 0.0f };
 			int sflags = 0, sounds = 0, movesnd = 0, stopsnd = 0;
-			int vol = 0, pitch = 0;
+			int vol = 0, pitch = 0, modelnum = 0;
 
 			while( 1 )
 			{
@@ -503,9 +553,18 @@ static void CL_SvenMapSoundsInit( void )
 					vol = Q_atoi( token );
 				else if( !Q_stricmp( keyname, "pitch" ))
 					pitch = Q_atoi( token );
+				else if( !Q_stricmp( keyname, "model" ) && token[0] == '*' )
+					modelnum = Q_atoi( token + 1 );
 				else if( !Q_stricmp( keyname, "origin" ))
 					sscanf( token, "%f %f %f", &org[0], &org[1], &org[2] );
 			}
+
+			// Brush-entity anchor: submodel bounds midpoint in world space.
+			// Lump "origin" is 0 0 0 for sliding doors/buttons/chargers, so it
+			// can neither match a mover nor position its sound.
+			{
+				vec3_t center;
+				qboolean hasCenter = CL_SvenBrushCenter( modelnum, center );
 
 			if( !Q_stricmp( cls, "ambient_generic" ) && msg[0] && svenAmbientsCount < SVEN_AMBIENTS_MAX )
 			{
@@ -535,12 +594,14 @@ static void CL_SvenMapSoundsInit( void )
 			{
 				sven_button_t *b = &svenButtons[svenButtonsCount];
 
-				VectorCopy( org, b->origin );
+				if( hasCenter ) VectorCopy( center, b->origin );
+				else VectorCopy( org, b->origin );
 				b->sounds = sounds;
+				b->model = modelnum;
 				svenButtonsCount++;
 				if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
-					Con_Printf( "SVEN-BTN: org=%.0f %.0f %.0f sounds=%d ('%s')\n",
-						org[0], org[1], org[2], sounds,
+					Con_Printf( "SVEN-BTN: org=%.0f %.0f %.0f sounds=%d model=*%d ('%s')\n",
+						b->origin[0], b->origin[1], b->origin[2], sounds, modelnum,
 						Sven_ButtonSound( sounds ) ? Sven_ButtonSound( sounds ) : "default" );
 			}
 			else if(( !Q_stricmp( cls, "func_door" ) || !Q_stricmp( cls, "func_door_rotating" ))
@@ -548,30 +609,36 @@ static void CL_SvenMapSoundsInit( void )
 			{
 				sven_door_t *d = &svenDoors[svenDoorsCount];
 
-				VectorCopy( org, d->origin );
+				if( hasCenter ) VectorCopy( center, d->origin );
+				else VectorCopy( org, d->origin );
 				d->movesnd = movesnd;
 				d->stopsnd = stopsnd;
+				d->model = modelnum;
 				svenDoorsCount++;
 				if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
-					Con_Printf( "SVEN-DOOR: org=%.0f %.0f %.0f movesnd=%d ('%s') stopsnd=%d ('%s')\n",
-						org[0], org[1], org[2], movesnd,
+					Con_Printf( "SVEN-DOOR: org=%.0f %.0f %.0f movesnd=%d ('%s') stopsnd=%d ('%s') model=*%d\n",
+						d->origin[0], d->origin[1], d->origin[2], movesnd,
 						Sven_DoorMoveSound( movesnd ) ? Sven_DoorMoveSound( movesnd ) : "silent",
 						stopsnd,
-						Sven_DoorStopSound( stopsnd ) ? Sven_DoorStopSound( stopsnd ) : "silent" );
+						Sven_DoorStopSound( stopsnd ) ? Sven_DoorStopSound( stopsnd ) : "silent",
+						modelnum );
 			}
 			else if(( !Q_stricmp( cls, "func_recharge" ) || !Q_stricmp( cls, "func_healthcharger" ))
 				&& svenChargersCount < SVEN_ENTSND_MAX )
 			{
 				sven_charger_t *c = &svenChargers[svenChargersCount];
 
-				VectorCopy( org, c->origin );
+				if( hasCenter ) VectorCopy( center, c->origin );
+				else VectorCopy( org, c->origin );
 				c->isSuit = !Q_stricmp( cls, "func_recharge" );
+				c->model = modelnum;
 				c->checkAt = 0.0f;
 				svenChargersCount++;
 				if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
-					Con_Printf( "SVEN-CHG: org=%.0f %.0f %.0f %s\n",
-						org[0], org[1], org[2], c->isSuit ? "suit" : "health" );
+					Con_Printf( "SVEN-CHG: org=%.0f %.0f %.0f %s model=*%d\n",
+						c->origin[0], c->origin[1], c->origin[2], c->isSuit ? "suit" : "health", modelnum );
 			}
+		}
 		}
 	}
 }
@@ -689,6 +756,12 @@ void CL_SvenPredictMapSounds( void )
 		dist = VectorLength( delta );
 		moving = ( dist > SVEN_MOVE_EPS );
 
+		// World-space brush center: rest pose equals the record center, so
+		// matching and positioning both work while lump "origin" is 0 0 0.
+		{
+			vec3_t liveCenter;
+			CL_SvenLiveCenter( ent, liveCenter );
+
 		if( svenMoverKnown[i] && ( moving != svenMoverMove[i] ) && ( dist > SVEN_MOVE_EPS || !moving ))
 		{
 			const char *snd = NULL;
@@ -701,18 +774,18 @@ void CL_SvenPredictMapSounds( void )
 			diag = hasbox ? ( VectorLength( ent->curstate.maxs ) - VectorLength( ent->curstate.mins )) : 0.0f;
 			isbutton = hasbox && diag < SVEN_SMALLBRUSH;
 
-			// match the mover to its recorded func_door by its rest origin
-			// (at rest the brush sits exactly on the recorded origin)
+			// match the mover to its recorded func_door by rest brush center
+			// (at rest the live center sits exactly on the record center)
 			if( !isbutton )
-				di = CL_SvenDoorByOrigin( ent->curstate.origin, SVEN_DOOR_MATCH );
+				di = CL_SvenDoorByOrigin( liveCenter, SVEN_DOOR_MATCH );
 
-			if( VectorDistance( ent->curstate.origin, cl.simorg ) < SVEN_MOVER_RANGE )
+			if( VectorDistance( liveCenter, cl.simorg ) < SVEN_MOVER_RANGE )
 			{
 				if( moving && isbutton )
 				{
 					// press: match against the map's func_button record -> its
 					// own "sounds" selector (m_sounds), exact server table
-					int bi = CL_SvenButtonByOrigin( ent->curstate.origin, SVEN_SMALLBRUSH );
+					int bi = CL_SvenButtonByOrigin( liveCenter, SVEN_BTN_MATCH );
 
 					snd = ( bi >= 0 ) ? Sven_ButtonSound( svenButtons[bi].sounds ) : NULL;
 					if( !snd ) snd = "buttons/button1.wav"; // default button press
@@ -732,7 +805,7 @@ void CL_SvenPredictMapSounds( void )
 					if( svenMoverLoop[i] )
 					{
 						handle = svenMoverLoop[i];
-						S_AmbientSound( ent->curstate.origin, i, handle, 0, 0, 0, SND_STOP );
+						S_AmbientSound( liveCenter, i, handle, 0, 0, 0, SND_STOP );
 						svenMoverLoop[i] = 0;
 					}
 					snd = NULL;
@@ -749,13 +822,14 @@ void CL_SvenPredictMapSounds( void )
 					{
 						if( moving && !isbutton )
 							svenMoverLoop[i] = handle; // remember for the stop
-						S_AmbientSound( ent->curstate.origin, i, handle, 1.0f, ATTN_NORM, 100, 0 );
+						S_AmbientSound( liveCenter, i, handle, 1.0f, ATTN_NORM, 100, 0 );
 					}
 					if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
 						Con_Printf( "SVEN-MOV: #%d '%s' %s diag=%.0f dist=%.2f btn=%d loop=%d\n", i, snd,
 							moving ? "MOVE" : "STOP", diag, dist, isbutton, svenMoverLoop[i] != 0 );
 				}
 			}
+		}
 		}
 
 		VectorCopy( ent->curstate.origin, svenMoverLast[i] );
