@@ -113,6 +113,28 @@ static void CL_ParseSoundPacket( sizebuf_t *msg, qboolean restore )
 		MSG_ReadBytes( msg, &forcedEnd, sizeof( forcedEnd ), sizeof( forcedEnd ));
 	}
 
+	// One concise line per vanilla sound so door-type interactions stay visible
+	// at debug 1 (Sven sessions normally never use this path; if one ever does,
+	// the resolved precache name — or its absence — shows here, not in 107).
+	if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
+	{
+		const char *vname = "(not precached)";
+		char vsent[32];
+		vsent[0] = '\0';
+		if( FBitSet( flags, SND_SENTENCE ))
+		{
+			if( FBitSet( flags, SND_SEQUENCE ))
+				Q_snprintf( vsent, sizeof( vsent ), "!#%i", sound + MAX_SOUNDS_NONSENTENCE );
+			else Q_snprintf( vsent, sizeof( vsent ), "!%i", sound );
+			vname = vsent;
+		}
+		else if( sound >= 0 && sound < MAX_SOUNDS && cl.sound_precache[sound][0] )
+			vname = cl.sound_precache[sound];
+		Con_Printf( "SND-VANILLA: idx=%d vol=%.2f pitch=%d attn=%.2f ch=%d ent=%d %s%s\n",
+			sound, volume, pitch, attn, chan, entnum, vname,
+			( !handle || !cl.audio_prepped ) ? " (DROP)" : "" );
+	}
+
 	if( !cl.audio_prepped )
 		return; // too early
 
@@ -2504,13 +2526,22 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 	// mirror the real client: sentence (0x100) sounds on far entities (>= 2048)
 	// are skipped (client.dll: cmp ent,0x800; jge error on the 0x100 branch).
 	if(( flags & SVEN_SND_SENTENCE ) && ent >= 2048 )
+	{
+		if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
+			Con_Printf( "SVEN-SOUND: flags=%04x idx=%d ent=%d [sent-skip: ent>=2048]\n",
+				flags, sndnum, ent );
 		return;
+	}
 
 	// sndnum < 0 means the message carried no index (0x10 clear): nothing to play.
 	// NOTE: index 0 is a VALID slot — SOUNDLIST[0] (first soundcache entry) or
 	// SENTENCELIST[0] (first sentence), so we must not < 0 guard on zero.
 	if( sndnum < 0 )
+	{
+		if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
+			Con_Printf( "SVEN-SOUND: flags=%04x (no index, dropped)\n", flags );
 		return;
+	}
 
 	// Table selection (client.dll reverse, steam-refs/chatgpt/answer9):
 	//   flags & 0x100          -> SENTENCELIST index, play the sentence NAME "!name"
@@ -2557,13 +2588,20 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 		if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
 		{
 			char sndname[64];
+			const char *drop = "";
 			if( !Q_strcmp( src, "cache" ))
 				Q_strncpy( sndname, svenSoundCache[sndnum], sizeof( sndname ));
 			else if( !Q_strcmp( src, "sent" ))
 				Q_strncpy( sndname, sentenceName, sizeof( sndname ));
 			else Q_strncpy( sndname, "(silent gap)", sizeof( sndname ));
-			Con_Printf( "SVEN-SOUND: flags=%04x idx=%d vol=%.2f pitch=%d attn=%.2f ch=%d ent=%d [%s%s] %s\n",
-				flags, sndnum, volume, pitch, attn, channel, ent, src, hasOrigin ? "" : " noloc", sndname );
+			// Make silent drops visible: unregistered (missing file) or audio
+			// not prepped (spawn-time) would otherwise vanish without a trace.
+			if( !handle )
+				drop = " (DROP: unregistered/missing file)";
+			else if( !cl.audio_prepped )
+				drop = " (DROP: audio not ready)";
+			Con_Printf( "SVEN-SOUND: flags=%04x idx=%d vol=%.2f pitch=%d attn=%.2f ch=%d ent=%d [%s%s] %s%s\n",
+				flags, sndnum, volume, pitch, attn, channel, ent, src, hasOrigin ? "" : " noloc", sndname, drop );
 		}
 		// LEVEL-200 DIAG: dump the soundcache neighborhood around this index so an
 		// off-by-N shows up instantly. P[] (precache) is printed for reference
