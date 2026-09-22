@@ -2439,6 +2439,34 @@ qboolean CL_SvenSoundActive( void )
 	return svenSoundCacheLoaded;
 }
 
+// 0bc76-style validity gate for svc107 playback. The stock Sven client's
+// StartSound handler is a read-and-drop stub, so nothing is replayed on PC;
+// Xash replays only the subset that provably belongs to something the client
+// can actually see this frame (players/NPCs the server is streaming, i.e.
+// "players shooting") or the world itself (ambients). Index references that
+// point at entities the client has never received, or that stopped updating,
+// stay silent exactly like the stub baseline — phantom/relay sound slots must
+// not turn into arbitrary filler audio next to the listener.
+static qboolean CL_SvenSoundEntityLive( int ent )
+{
+	cl_entity_t *p;
+
+	if( ent == 0 )
+		return true; // world/static ambients
+
+	if(( ent - 1 ) == cl.playernum || ( ent - 1 ) < 0 )
+		return true; // self sounds play through the full-volume S_IsClient path
+
+	p = CL_GetEntityByIndex( ent );
+	if( !p || !p->model )
+		return false; // never received
+
+	if( p->curstate.messagenum != cl.parsecount )
+		return false; // no longer updating (stale/phantom)
+
+	return true;
+}
+
 /*
 ==============
 CL_ParseSvenStartSound
@@ -2560,6 +2588,13 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 		return;
 	}
 
+	// 0bc76-style playback gate: keep sounds attached to things the client can
+	// actually see this frame (players/NPCs streaming, i.e. "players shooting")
+	// plus world ambients; drop identical index slots that reference entities
+	// the client never received or that stopped updating — those come back as
+	// the same silence the stock Sven client's StartSound stub produces.
+	const qboolean entLive = CL_SvenSoundEntityLive( ent );
+
 	// Table selection (client.dll reverse, steam-refs/chatgpt/answer9):
 	//   flags & 0x100          -> SENTENCELIST index, play the sentence NAME "!name"
 	//   flags & 0x100 == 0     -> SOUNDLIST index into maps/soundcache/<map>.txt
@@ -2599,7 +2634,7 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 
 		// 0x20: stop the previous instance on this channel first (rapid-fire
 		// tails must not pile up), then fall through and play normally.
-		if(( flags & 0x20 ) && stopname && stopname[0] )
+		if(( flags & 0x20 ) && stopname && stopname[0] && entLive )
 			S_StopSound( ent, channel, stopname );
 
 		if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
@@ -2611,12 +2646,15 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 			else if( !Q_strcmp( src, "sent" ))
 				Q_strncpy( sndname, sentenceName, sizeof( sndname ));
 			else Q_strncpy( sndname, "(silent gap)", sizeof( sndname ));
-			// Make silent drops visible: unregistered (missing file) or audio
-			// not prepped (spawn-time) would otherwise vanish without a trace.
+			// Make silent drops visible: unregistered (missing file), audio
+			// not prepped (spawn-time), or a phantom entity (0bc76 baseline)
+			// would otherwise vanish without a trace.
 			if( !handle )
 				drop = " (DROP: unregistered/missing file)";
 			else if( !cl.audio_prepped )
 				drop = " (DROP: audio not ready)";
+			else if( !entLive )
+				drop = " (DROP: entity not live)";
 			Con_Printf( "SVEN-SOUND: flags=%04x idx=%d vol=%.2f pitch=%d attn=%.2f ch=%d ent=%d [%s%s] %s%s\n",
 				flags, sndnum, volume, pitch, attn, channel, ent, src, hasOrigin ? "" : " noloc", sndname, drop );
 		}
@@ -2654,7 +2692,7 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 		}
 	}
 
-	if( !handle || !cl.audio_prepped )
+	if( !entLive || !handle || !cl.audio_prepped )
 		return;
 
 	// No ORIGIN on the wire (e.g. flags 0x30 sounds routed via a proxy ent like
