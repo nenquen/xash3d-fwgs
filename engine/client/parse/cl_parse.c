@@ -2439,14 +2439,10 @@ qboolean CL_SvenSoundActive( void )
 	return svenSoundCacheLoaded;
 }
 
-// 0bc76-style validity gate for svc107 playback. The stock Sven client's
-// StartSound handler is a read-and-drop stub, so nothing is replayed on PC;
-// Xash replays only the subset that provably belongs to something the client
-// can actually see this frame (players/NPCs the server is streaming, i.e.
-// "players shooting") or the world itself (ambients). Index references that
-// point at entities the client has never received, or that stopped updating,
-// stay silent exactly like the stub baseline — phantom/relay sound slots must
-// not turn into arbitrary filler audio next to the listener.
+// Liveness probe for svc107 sounds. Reports whether the referenced entity is
+// something the client can see this frame (streamed players/NPCs, world).
+// Used for diagnostics and the SVEN-RELAY report only — phantom slots are
+// played, not dropped (see the gate in CL_ParseSvenStartSound).
 static qboolean CL_SvenSoundEntityLive( int ent )
 {
 	cl_entity_t *p;
@@ -2588,18 +2584,22 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 		return;
 	}
 
-	// 0bc76-style playback gate: keep sounds attached to things the client can
-	// actually see this frame (players/NPCs streaming, i.e. "players shooting")
-	// plus world ambients; drop identical index slots that reference entities
-	// the client never received or that stopped updating — those come back as
-	// the same silence the stock Sven client's StartSound stub produces.
-	// Wave 1 relaxation (user feedback: the vanilla reference build b98411a
-	// played all of this map's sounds and sounded correct): when the wire
-	// carries an ORIGIN (the huge majority here — impacts, grunts, fallpain,
-	// turret chatter) the sound is a positional event and does not require the
-	// named client entity to be alive to be heard; only ORIGIN-less sounds
-	// keep the strict entity-liveness gate so proxy/phantom slots (the ones
-	// routed through an entity that never exists, e.g. 419) stay silent.
+	// Playback gate: relay/phantom sounds (ORIGIN-less, entity never streamed)
+	// are PASSED THROUGH, not dropped. Rationale, from a full-session log
+	// (2528 svc107 sounds): 985 drops were all phantom-ent/noloc, and whole
+	// sound families exist ONLY in that form — pl_swim2/3, wpn_select,
+	// pwrench_miss2 (152 each), bcl_chew1 (361) — with zero positional
+	// copies. The stock client must render them (barnacle chew next to the
+	// player is unmistakably audible on PC), so silence can't be right.
+	// This is crash-safe: CL_GetEntitySpatialization falls back to the
+	// channel origin when the entity is absent, i.e. (0,0,0) distance
+	// falloff — identical to the old silence — while a relay entity that
+	// DOES exist (positioned by the server) re-anchors the channel and the
+	// sound becomes positional automatically. The one-shot SVEN-RELAY line
+	// below reports the relay slot state so the next log settles whether
+	// these slots carry positions server-side.
+	// Wave 1 relaxation (positional sounds need no live entity) stays:
+	// a wire ORIGIN is still an event at a point.
 	const qboolean entLive = CL_SvenSoundEntityLive( ent ) || hasOrigin;
 
 	// Table selection (client.dll reverse, steam-refs/chatgpt/answer9):
@@ -2641,7 +2641,8 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 
 		// 0x20: stop the previous instance on this channel first (rapid-fire
 		// tails must not pile up), then fall through and play normally.
-		if(( flags & 0x20 ) && stopname && stopname[0] && entLive )
+		// Runs for phantom slots too: their channels are real channels.
+		if(( flags & 0x20 ) && stopname && stopname[0] )
 			S_StopSound( ent, channel, stopname );
 
 		if( Cvar_VariableInteger( "cl_goldsrc_debug" ) >= 1 )
@@ -2653,17 +2654,45 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 			else if( !Q_strcmp( src, "sent" ))
 				Q_strncpy( sndname, sentenceName, sizeof( sndname ));
 			else Q_strncpy( sndname, "(silent gap)", sizeof( sndname ));
-			// Make silent drops visible: unregistered (missing file), audio
-			// not prepped (spawn-time), or a phantom entity (0bc76 baseline)
-			// would otherwise vanish without a trace.
+			// Make silent drops visible: unregistered (missing file) or audio
+			// not prepped (spawn-time) would otherwise vanish without a trace.
+			// Phantom slots are NOT dropped anymore (see gate above); the
+			// one-shot SVEN-RELAY line describes the relay slot instead.
 			if( !handle )
 				drop = " (DROP: unregistered/missing file)";
 			else if( !cl.audio_prepped )
 				drop = " (DROP: audio not ready)";
-			else if( !entLive )
-				drop = " (DROP: entity not live)";
-			Con_Printf( "SVEN-SOUND: flags=%04x idx=%d vol=%.2f pitch=%d attn=%.2f ch=%d ent=%d [%s%s] %s%s\n",
-				flags, sndnum, volume, pitch, attn, channel, ent, src, hasOrigin ? "" : " noloc", sndname, drop );
+			Con_Printf( "SVEN-SOUND: flags=%04x idx=%d vol=%.2f pitch=%d attn=%.2f ch=%d ent=%d [%s%s%s] %s%s\n",
+				flags, sndnum, volume, pitch, attn, channel, ent, src, hasOrigin ? "" : " noloc",
+				entLive ? "" : " phantom", sndname, drop );
+			if( !entLive && handle )
+			{
+				// one-shot relay-slot report (8 slots per map): does the
+				// server stream anything at this entity index at all?
+				static int relayEnts[8];
+				static char relayMap[64];
+				int k, slot = -1;
+				cl_entity_t *re;
+				if( Q_strcmp( relayMap, clgame.mapname ))
+				{
+					memset( relayEnts, 0, sizeof( relayEnts ));
+					Q_strncpy( relayMap, clgame.mapname, sizeof( relayMap ));
+				}
+				for( k = 0; k < 8; k++ )
+				{
+					if( relayEnts[k] == ent ) break;
+					if( !relayEnts[k] && slot < 0 ) slot = k;
+				}
+				if( k == 8 && slot >= 0 )
+				{
+					relayEnts[slot] = ent;
+					re = CL_GetEntityByIndex( ent );
+					Con_Printf( "SVEN-RELAY: ent=%d exists=%d model=%d origin=(%.0f %.0f %.0f) msg=%d parse=%d maxent=%d\n",
+						ent, re != NULL, re && re->model != NULL,
+						re ? re->origin[0] : 0, re ? re->origin[1] : 0, re ? re->origin[2] : 0,
+						re ? re->curstate.messagenum : -1, cl.parsecount, clgame.maxEntities );
+				}
+			}
 		}
 		// LEVEL-200 DIAG: dump the soundcache neighborhood around this index so an
 		// off-by-N shows up instantly. P[] (precache) is printed for reference
@@ -2699,7 +2728,7 @@ static void CL_ParseSvenStartSound( const char *pszName, int iSize, void *pbuf )
 		}
 	}
 
-	if( !entLive || !handle || !cl.audio_prepped )
+	if( !handle || !cl.audio_prepped )
 		return;
 
 	// No ORIGIN on the wire (e.g. flags 0x30 sounds routed via a proxy ent like
